@@ -5,8 +5,8 @@
   "author": {
     "name": "Radu Lupu"
   },
-  "homepage": "https://github.com/radulupu/qmd-memory",
-  "repository": "https://github.com/radulupu/qmd-memory",
+  "homepage": "https://github.com/radu2lupu/qmd-memory",
+  "repository": "https://github.com/radu2lupu/qmd-memory",
   "license": "MIT",
   "keywords": ["memory", "knowledge", "semantic-search", "sessions", "qmd"],
   "hooks": {

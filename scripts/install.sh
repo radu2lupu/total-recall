@@ -2,10 +2,10 @@
 # qmd-memory plugin installer for Claude Code
 #
 # Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/radulupu/qmd-memory/main/scripts/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/radu2lupu/qmd-memory/main/scripts/install.sh)
 #
 # This script is a convenience wrapper. You can also install directly in Claude Code:
-#   /plugin marketplace add radulupu/qmd-memory
+#   /plugin marketplace add radu2lupu/qmd-memory
 #   /plugin install qmd-memory@qmd-memory
 
 set -e
@@ -29,7 +29,7 @@ echo ""
 echo "qmd is installed. To set up the Claude Code plugin:"
 echo ""
 echo "  1. Open Claude Code"
-echo "  2. Run: /plugin marketplace add radulupu/qmd-memory"
+echo "  2. Run: /plugin marketplace add radu2lupu/qmd-memory"
 echo "  3. Run: /plugin install qmd-memory@qmd-memory"
 echo "  4. Run: /memory-setup  (in any project to initialize memory)"
 echo ""
