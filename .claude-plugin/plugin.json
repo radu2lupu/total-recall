@@ -1,0 +1,24 @@
+{
+  "name": "qmd-memory",
+  "version": "1.0.0",
+  "description": "Cross-session semantic memory for Claude Code. Provides knowledge persistence via BM25 + vector search using qmd.",
+  "author": {
+    "name": "Radu Lupu"
+  },
+  "homepage": "https://github.com/radulupu/qmd-memory",
+  "repository": "https://github.com/radulupu/qmd-memory",
+  "license": "MIT",
+  "keywords": ["memory", "knowledge", "semantic-search", "sessions", "qmd"],
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-summary-reminder.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
