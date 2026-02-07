@@ -1,16 +1,16 @@
 #!/bin/bash
-# qmd-memory plugin installer for Claude Code
+# total-recall plugin installer for Claude Code
 #
 # Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/radu2lupu/qmd-memory/main/scripts/install.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/radu2lupu/total-recall/main/scripts/install.sh)
 #
 # This script is a convenience wrapper. You can also install directly in Claude Code:
-#   /plugin marketplace add radu2lupu/qmd-memory
-#   /plugin install qmd-memory@qmd-memory
+#   /plugin marketplace add radu2lupu/total-recall
+#   /plugin install total-recall@total-recall
 
 set -e
 
-echo "=== qmd-memory installer ==="
+echo "=== total-recall installer ==="
 echo ""
 
 # Check prerequisites
@@ -29,8 +29,8 @@ echo ""
 echo "qmd is installed. To set up the Claude Code plugin:"
 echo ""
 echo "  1. Open Claude Code"
-echo "  2. Run: /plugin marketplace add radu2lupu/qmd-memory"
-echo "  3. Run: /plugin install qmd-memory@qmd-memory"
+echo "  2. Run: /plugin marketplace add radu2lupu/total-recall"
+echo "  3. Run: /plugin install total-recall@total-recall"
 echo "  4. Run: /memory-setup  (in any project to initialize memory)"
 echo ""
 echo "Commands available after install:"

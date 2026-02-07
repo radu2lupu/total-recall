@@ -1,4 +1,4 @@
-# qmd-memory
+# total-recall
 
 Cross-session semantic memory for [Claude Code](https://claude.com/claude-code). Gives Claude persistent knowledge across conversations using [qmd](https://github.com/tobi/qmd) for BM25 + vector search.
 
@@ -15,14 +15,14 @@ Cross-session semantic memory for [Claude Code](https://claude.com/claude-code).
 In Claude Code:
 
 ```
-/plugin marketplace add radu2lupu/qmd-memory
-/plugin install qmd-memory@qmd-memory
+/plugin marketplace add radu2lupu/total-recall
+/plugin install total-recall@total-recall
 ```
 
 Or install prerequisites first via shell:
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/radu2lupu/qmd-memory/main/scripts/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/radu2lupu/total-recall/main/scripts/install.sh)
 ```
 
 ### Prerequisites

@@ -1,19 +1,19 @@
 {
-  "name": "qmd-memory",
+  "name": "total-recall",
   "owner": {
     "name": "Radu Lupu"
   },
   "plugins": [
     {
-      "name": "qmd-memory",
+      "name": "total-recall",
       "source": ".",
       "description": "Cross-session semantic memory for Claude Code. Provides knowledge persistence via BM25 + vector search using qmd.",
       "version": "1.0.0",
       "author": {
         "name": "Radu Lupu"
       },
-      "homepage": "https://github.com/radu2lupu/qmd-memory",
-      "repository": "https://github.com/radu2lupu/qmd-memory",
+      "homepage": "https://github.com/radu2lupu/total-recall",
+      "repository": "https://github.com/radu2lupu/total-recall",
       "license": "MIT",
       "keywords": ["memory", "knowledge", "semantic-search", "sessions", "qmd"]
     }
