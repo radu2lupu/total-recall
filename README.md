@@ -1,95 +1,73 @@
 # total-recall
 
-Cross-session semantic memory for [Claude Code](https://claude.com/claude-code). Gives Claude persistent knowledge across conversations using [qmd](https://github.com/tobi/qmd) for BM25 + vector search.
+Install once, then Claude Code + Codex share one `qmd` memory, auto-import session logs, and keep it synced in the background (including iCloud).
 
-## What It Does
+## One Command Install
 
-- Stores session summaries, architectural decisions, patterns, and bug notes as markdown files
-- Searches them with BM25 full-text and vector similarity via qmd
-- Auto-detects project name from git remote
-- Reminds you to write a summary when ending a session (Stop hook)
-- Provides an MCP server for semantic search within Claude Code
+```bash
+./scripts/install.sh --project total-recall
+```
 
-## Installation
+What `install` does automatically:
+- Creates shared memory at `~/.ai-memory/knowledge/<project>`.
+- Links:
+  - `~/.claude/knowledge/<project>`
+  - `~/.codex/knowledge/<project>`
+- Enables `qmd` MCP in both:
+  - `~/.claude/settings.json`
+  - `~/.codex/config.toml`
+- Enables iCloud-backed memory (default) at:
+  - `~/Library/Mobile Documents/com~apple~CloudDocs/AI-Memory/knowledge/<project>`
+- Imports existing Codex and Claude session history into markdown memory files.
+- Re-indexes + embeds into `qmd`.
+- Injects auto-memory instructions into:
+  - `~/.claude/CLAUDE.md`
+  - `~/.codex/AGENTS.md`
+- Installs a macOS `launchd` background job that re-runs ingestion periodically.
+
+## Claude Plugin Usage
 
 In Claude Code:
 
-```
+```text
 /plugin marketplace add radu2lupu/total-recall
 /plugin install total-recall@total-recall
 ```
 
-Or install prerequisites first via shell:
+The plugin commands are still available:
+- `/memory-setup`
+- `/memory-write`
+- `/memory-rebuild`
+
+## Core Commands
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/radu2lupu/total-recall/main/scripts/install.sh)
+./scripts/total-recall install --project my-project
+./scripts/total-recall ingest --project my-project
+./scripts/total-recall query --project my-project "retry strategy for upload queue"
+./scripts/total-recall write --project my-project "implemented deduplicated retry backoff"
+./scripts/total-recall status --project my-project
+./scripts/total-recall icloud-status --project my-project
 ```
 
-### Prerequisites
+## Install Options
 
-- [bun](https://bun.sh/) (`curl -fsSL https://bun.sh/install | bash`)
-- [jq](https://jqlang.github.io/jq/) (for the Stop hook)
-
-qmd itself is installed automatically by `/memory-setup`.
-
-## Setup
-
-After installing the plugin, open Claude Code in any project and run:
-
-```
-/memory-setup
+```bash
+./scripts/total-recall install --project my-project --interval-minutes 10
+./scripts/total-recall install --project my-project --no-icloud
+./scripts/total-recall install --project my-project --no-launch-agent
+./scripts/total-recall install --project my-project --skip-embed
 ```
 
-This will:
-1. Install `qmd` if needed
-2. Create `~/.claude/knowledge/<project>/` with subdirectories
-3. Initialize the qmd index and embeddings
-4. Create a project MEMORY.md for cross-session context
-5. Add the qmd MCP server to your settings
-6. Auto-approve `qmd` bash commands (so Claude can search memory without prompting)
+## Notes
 
-Run `/memory-setup` once per project.
-
-## Commands
-
-### `/memory-write [description]`
-
-Write a session summary after completing work.
-
-```
-/memory-write "fixed auth bug and added rate limiting"
-```
-
-### `/memory-rebuild [--since YYYY-MM-DD] [--codex]`
-
-Reconstruct session history from git commits. Useful for backfilling memory on existing projects.
-
-```
-/memory-rebuild --since 2025-06-01
-/memory-rebuild --codex
-```
-
-### `/memory-setup`
-
-Initialize memory for the current project (first-time setup per project).
-
-## Knowledge Directory
-
-```
-~/.claude/knowledge/<project>/
-├── sessions/     # YYYY-MM-DD-topic.md session summaries
-├── decisions/    # Architectural decisions
-├── patterns/     # Recurring patterns & solutions
-└── bugs/         # Notable bugs & fixes
-```
-
-## How It Works
-
-1. **Plugin hooks** — A Stop hook reminds you to run `/memory-write` after non-trivial sessions
-2. **Slash commands** — `/memory-write` analyzes git history and conversation context, writes a structured markdown summary
-3. **qmd indexing** — Summaries are indexed for BM25 full-text search and embedded for vector similarity
-4. **MEMORY.md** — Each project gets a MEMORY.md that's loaded into Claude's system prompt, telling it how to query past knowledge
-5. **MCP server** — qmd runs as an MCP server so Claude can search your knowledge base directly
+- Ingestion state is stored at `~/.ai-memory/state/<project>.json`.
+- Imported logs are written under:
+  - `~/.ai-memory/knowledge/<project>/sessions/imported/codex/`
+  - `~/.ai-memory/knowledge/<project>/sessions/imported/claude/`
+- Existing knowledge dirs are preserved as timestamped backups when replaced by symlinks.
+- `qmd embed` failures during cleanup are treated as non-fatal.
+- For stronger cloud security, enable Apple Advanced Data Protection.
 
 ## License
 

@@ -1,0 +1,1051 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+DEFAULT_SHARED_ROOT="${TOTAL_RECALL_SHARED_ROOT:-$HOME/.ai-memory/knowledge}"
+DEFAULT_CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
+DEFAULT_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+DEFAULT_ICLOUD_ROOT="${TOTAL_RECALL_ICLOUD_ROOT:-$HOME/Library/Mobile Documents/com~apple~CloudDocs/AI-Memory/knowledge}"
+DEFAULT_STATE_ROOT="${TOTAL_RECALL_STATE_ROOT:-$HOME/.ai-memory/state}"
+DEFAULT_LAUNCH_INTERVAL_MINUTES="${TOTAL_RECALL_SYNC_INTERVAL_MINUTES:-15}"
+
+usage() {
+  cat <<'EOF'
+total-recall: shared qmd memory bridge for Claude + Codex
+
+Usage:
+  total-recall setup [--project NAME] [--shared-root PATH] [--skip-embed] [--dry-run]
+  total-recall write "<summary>" [--project NAME] [--shared-root PATH]
+  total-recall query "<query>" [--project NAME]
+  total-recall status [--project NAME]
+  total-recall ingest [--project NAME] [--shared-root PATH] [--skip-embed] [--json]
+  total-recall install [--project NAME] [--shared-root PATH] [--icloud|--no-icloud] [--icloud-root PATH] [--interval-minutes N] [--skip-embed] [--no-launch-agent]
+  total-recall icloud-enable [--project NAME] [--shared-root PATH] [--icloud-root PATH] [--skip-embed]
+  total-recall icloud-sync [--project NAME] [--shared-root PATH] [--icloud-root PATH] [--direction push|pull|both]
+  total-recall icloud-status [--project NAME] [--shared-root PATH] [--icloud-root PATH]
+
+Notes:
+  - setup links both ~/.claude/knowledge/<project> and ~/.codex/knowledge/<project>
+    to one shared directory and configures qmd MCP for both tools.
+  - ingest imports Claude/Codex session logs into markdown memory automatically.
+  - install runs end-to-end setup + ingestion + instruction injection + background sync.
+  - icloud-enable moves the shared project memory to iCloud and symlinks local path to it.
+  - icloud-sync is a manual backup/restore sync helper.
+  - write creates a markdown session note and re-indexes qmd.
+  - query runs qmd hybrid search scoped to the project collection when possible.
+EOF
+}
+
+die() {
+  echo "Error: $*" >&2
+  exit 1
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "Missing required command: $1"
+}
+
+abs_realpath() {
+  python3 - "$1" <<'PY'
+import os, sys
+print(os.path.realpath(os.path.expanduser(sys.argv[1])))
+PY
+}
+
+resolve_link_target() {
+  python3 - "$1" <<'PY'
+import os
+import sys
+
+link_path = os.path.expanduser(sys.argv[1])
+if not os.path.islink(link_path):
+    print("")
+    raise SystemExit(0)
+
+target = os.readlink(link_path)
+if os.path.isabs(target):
+    print(os.path.realpath(target))
+else:
+    print(os.path.realpath(os.path.join(os.path.dirname(link_path), target)))
+PY
+}
+
+slugify() {
+  local raw="$1"
+  local out
+  out="$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g')"
+  if [[ -z "$out" ]]; then
+    out="memory"
+  fi
+  printf '%s' "$out"
+}
+
+derive_project_name() {
+  local explicit="$1"
+  if [[ -n "$explicit" ]]; then
+    printf '%s' "$(slugify "$explicit")"
+    return
+  fi
+
+  local remote repo
+  if remote="$(git -C "$PWD" remote get-url origin 2>/dev/null)"; then
+    repo="$(basename "$remote")"
+    repo="${repo%.git}"
+    printf '%s' "$(slugify "$repo")"
+    return
+  fi
+
+  printf '%s' "$(slugify "$(basename "$PWD")")"
+}
+
+safe_mkdir() {
+  mkdir -p "$1"
+}
+
+require_icloud_drive() {
+  local drive="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+  [[ -d "$drive" ]] || die "iCloud Drive not found at $drive (enable iCloud Drive first)"
+}
+
+backup_name() {
+  local path="$1"
+  printf '%s.backup.%s' "$path" "$(date +%Y%m%d%H%M%S)"
+}
+
+sync_dirs_ignore_existing() {
+  local src="$1"
+  local dst="$2"
+  require_cmd rsync
+  safe_mkdir "$dst"
+  rsync -a --ignore-existing "$src/" "$dst/"
+}
+
+sync_dirs_mirror() {
+  local src="$1"
+  local dst="$2"
+  require_cmd rsync
+  safe_mkdir "$dst"
+  rsync -a --delete "$src/" "$dst/"
+}
+
+script_dir() {
+  python3 - "${BASH_SOURCE[0]}" <<'PY'
+import os, sys
+print(os.path.dirname(os.path.realpath(sys.argv[1])))
+PY
+}
+
+script_path() {
+  abs_realpath "${BASH_SOURCE[0]}"
+}
+
+upsert_markdown_block() {
+  local file_path="$1"
+  local start_marker="$2"
+  local end_marker="$3"
+  local block_content="$4"
+  safe_mkdir "$(dirname "$file_path")"
+
+  python3 - "$file_path" "$start_marker" "$end_marker" "$block_content" <<'PY'
+import os
+import re
+import sys
+
+path, start, end, block = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+os.makedirs(os.path.dirname(os.path.expanduser(path)), exist_ok=True)
+full = f"{start}\n{block}\n{end}"
+
+if os.path.exists(path):
+    with open(path, "r", encoding="utf-8") as f:
+        original = f.read()
+else:
+    original = ""
+
+pattern = re.compile(re.escape(start) + r".*?" + re.escape(end), re.S)
+if pattern.search(original):
+    updated = pattern.sub(full, original)
+else:
+    if original and not original.endswith("\n"):
+        original += "\n"
+    if original:
+        updated = original + "\n" + full + "\n"
+    else:
+        updated = full + "\n"
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(updated)
+PY
+}
+
+install_instruction_blocks() {
+  local project_name="$1"
+  local shared_root="$2"
+  local cli_path="$3"
+  local claude_file="$DEFAULT_CLAUDE_HOME/CLAUDE.md"
+  local codex_file="$DEFAULT_CODEX_HOME/AGENTS.md"
+  local start_marker="<!-- total-recall:auto:start -->"
+  local end_marker="<!-- total-recall:auto:end -->"
+
+  local block
+  block=$(cat <<EOF
+## Total Recall Auto-Memory ($project_name)
+- At session start, automatically query memory before planning work:
+  - \`$cli_path query --project $project_name "<task context>"\`
+- During and after non-trivial work, automatically persist memory:
+  - \`$cli_path write --project $project_name "<what changed and why>"\`
+- Keep memory fresh from raw logs:
+  - \`$cli_path ingest --project $project_name --shared-root $shared_root\`
+- Use qmd memory search first when prior context could help.
+EOF
+)
+
+  upsert_markdown_block "$claude_file" "$start_marker" "$end_marker" "$block"
+  upsert_markdown_block "$codex_file" "$start_marker" "$end_marker" "$block"
+}
+
+install_launch_agent() {
+  local project_name="$1"
+  local shared_root="$2"
+  local cli_path="$3"
+  local interval_minutes="$4"
+  local interval_seconds
+  interval_seconds=$((interval_minutes * 60))
+  local uid
+  uid="$(id -u)"
+
+  local label="com.totalrecall.sync.$project_name"
+  local launch_dir="$HOME/Library/LaunchAgents"
+  local log_dir="$HOME/.ai-memory/logs"
+  local plist="$launch_dir/$label.plist"
+  local stdout_log="$log_dir/$project_name-sync.out.log"
+  local stderr_log="$log_dir/$project_name-sync.err.log"
+  safe_mkdir "$launch_dir"
+  safe_mkdir "$log_dir"
+
+  if ! command -v launchctl >/dev/null 2>&1; then
+    echo "launchctl not found; skipped launch agent install."
+    return
+  fi
+
+  python3 - "$plist" "$label" "$cli_path" "$project_name" "$shared_root" "$stdout_log" "$stderr_log" "$interval_seconds" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+
+plist_path, label, cli, project, shared_root, stdout_log, stderr_log, interval_seconds = sys.argv[1:]
+interval = int(interval_seconds)
+cmd = (
+    'export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"; '
+    f'"{cli}" ingest --project "{project}" --shared-root "{shared_root}"'
+)
+
+payload = {
+    "Label": label,
+    "ProgramArguments": ["/bin/bash", "-lc", cmd],
+    "RunAtLoad": True,
+    "StartInterval": interval,
+    "StandardOutPath": stdout_log,
+    "StandardErrorPath": stderr_log,
+    "ProcessType": "Background",
+}
+
+Path(plist_path).parent.mkdir(parents=True, exist_ok=True)
+with open(plist_path, "wb") as f:
+    plistlib.dump(payload, f)
+PY
+
+  launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+  if ! launchctl bootstrap "gui/$uid" "$plist" >/dev/null 2>&1; then
+    launchctl load -w "$plist" >/dev/null 2>&1 || true
+  fi
+  launchctl kickstart -k "gui/$uid/$label" >/dev/null 2>&1 || true
+
+  echo "Installed launch agent: $label (every ${interval_minutes}m)"
+  echo "Logs:"
+  echo "  $stdout_log"
+  echo "  $stderr_log"
+}
+
+merge_into_dir_if_present() {
+  local src="$1"
+  local dst="$2"
+
+  if [[ -d "$src" ]]; then
+    sync_dirs_ignore_existing "$src" "$dst"
+  fi
+}
+
+link_to_shared() {
+  local link_path="$1"
+  local shared_target="$2"
+
+  safe_mkdir "$(dirname "$link_path")"
+
+  if [[ -L "$link_path" ]]; then
+    local resolved_current resolved_target
+    resolved_current="$(resolve_link_target "$link_path")"
+    resolved_target="$(abs_realpath "$shared_target")"
+    if [[ "$resolved_current" == "$resolved_target" ]]; then
+      return
+    fi
+    rm -f "$link_path"
+  elif [[ -e "$link_path" ]]; then
+    merge_into_dir_if_present "$link_path" "$shared_target"
+    local backup
+    backup="$(backup_name "$link_path")"
+    mv "$link_path" "$backup"
+    echo "Backed up $link_path -> $backup"
+  fi
+
+  ln -s "$shared_target" "$link_path"
+}
+
+ensure_claude_settings() {
+  local claude_settings="$1"
+  safe_mkdir "$(dirname "$claude_settings")"
+
+  python3 - "$claude_settings" <<'PY'
+import json
+import os
+import sys
+
+path = os.path.expanduser(sys.argv[1])
+data = {}
+if os.path.exists(path):
+    with open(path, "r", encoding="utf-8") as f:
+        txt = f.read().strip()
+    if txt:
+        data = json.loads(txt)
+
+if not isinstance(data, dict):
+    raise SystemExit("~/.claude/settings.json must contain a JSON object")
+
+mcp = data.setdefault("mcpServers", {})
+if not isinstance(mcp, dict):
+    mcp = {}
+    data["mcpServers"] = mcp
+
+mcp["qmd"] = {"command": "qmd", "args": ["mcp"]}
+
+allowed = data.setdefault("allowedTools", [])
+if not isinstance(allowed, list):
+    allowed = []
+    data["allowedTools"] = allowed
+if "Bash(qmd *)" not in allowed:
+    allowed.append("Bash(qmd *)")
+
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+}
+
+ensure_codex_settings() {
+  local codex_config="$1"
+  safe_mkdir "$(dirname "$codex_config")"
+
+  if [[ ! -f "$codex_config" ]]; then
+    cat >"$codex_config" <<'EOF'
+[mcp_servers.qmd]
+command = "qmd"
+args = ["mcp"]
+EOF
+    return
+  fi
+
+  if grep -Eq '^\[mcp_servers\.qmd\]' "$codex_config"; then
+    return
+  fi
+
+  {
+    echo ""
+    echo "[mcp_servers.qmd]"
+    echo 'command = "qmd"'
+    echo 'args = ["mcp"]'
+  } >>"$codex_config"
+}
+
+ensure_collection() {
+  local collection_name="$1"
+  local shared_project_dir="$2"
+  local project_name="$3"
+  local skip_embed="$4"
+  local canonical_dir
+
+  require_cmd qmd
+  canonical_dir="$(abs_realpath "$shared_project_dir")"
+
+  if ! qmd ls "$collection_name" >/dev/null 2>&1; then
+    qmd collection add "$canonical_dir" --name "$collection_name" --mask "**/*.md"
+  fi
+
+  if ! qmd context list 2>/dev/null | grep -Fq "$canonical_dir"; then
+    if ! qmd context add "$canonical_dir" "Shared Claude + Codex memory for project $project_name" >/dev/null 2>&1; then
+      qmd collection remove "$collection_name" >/dev/null 2>&1 || true
+      qmd collection add "$canonical_dir" --name "$collection_name" --mask "**/*.md"
+      qmd context add "$canonical_dir" "Shared Claude + Codex memory for project $project_name"
+    fi
+  fi
+
+  qmd update
+  if [[ "$skip_embed" != "1" ]]; then
+    qmd embed || true
+  fi
+}
+
+write_memory_note() {
+  local project_name="$1"
+  local shared_root="$2"
+  shift 2
+  local summary="$*"
+
+  [[ -n "$summary" ]] || die "write requires a summary string"
+
+  local shared_project_dir="$shared_root/$project_name"
+  local sessions_dir="$shared_project_dir/sessions"
+  safe_mkdir "$sessions_dir"
+
+  local date_str topic filename i
+  date_str="$(date +%Y-%m-%d)"
+  topic="$(slugify "$(printf '%s' "$summary" | cut -d' ' -f1-6)")"
+  filename="$sessions_dir/$date_str-$topic.md"
+  i=2
+  while [[ -e "$filename" ]]; do
+    filename="$sessions_dir/$date_str-$topic-$i.md"
+    i=$((i + 1))
+  done
+
+  cat >"$filename" <<EOF
+# Session: ${summary}
+
+**Date:** ${date_str}
+**Topic:** ${topic}
+**Tool:** Claude Code / Codex
+
+## What Was Done
+- ${summary}
+
+## Decisions Made
+- Shared memory stored under \`${shared_project_dir}\`.
+
+## Lessons Learned
+- Keep memory notes concise and include concrete file paths or commands when relevant.
+EOF
+
+  local collection_name
+  collection_name="$(slugify "$project_name")"
+  qmd update
+  qmd embed || true
+
+  echo "Wrote memory: $filename"
+  echo "Collection: $collection_name"
+}
+
+cmd_setup() {
+  local project_arg=""
+  local shared_root="$DEFAULT_SHARED_ROOT"
+  local skip_embed="0"
+  local dry_run="0"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        project_arg="${2:-}"
+        shift 2
+        ;;
+      --shared-root)
+        shared_root="${2:-}"
+        shift 2
+        ;;
+      --skip-embed)
+        skip_embed="1"
+        shift
+        ;;
+      --dry-run)
+        dry_run="1"
+        shift
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown setup option: $1"
+        ;;
+    esac
+  done
+
+  local project_name shared_project_dir
+  project_name="$(derive_project_name "$project_arg")"
+  shared_root="$(abs_realpath "$shared_root")"
+  shared_project_dir="$shared_root/$project_name"
+
+  local claude_project_dir codex_project_dir
+  claude_project_dir="$DEFAULT_CLAUDE_HOME/knowledge/$project_name"
+  codex_project_dir="$DEFAULT_CODEX_HOME/knowledge/$project_name"
+
+  echo "Project: $project_name"
+  echo "Shared memory: $shared_project_dir"
+  echo "Claude path: $claude_project_dir"
+  echo "Codex path: $codex_project_dir"
+
+  if [[ "$dry_run" == "1" ]]; then
+    echo "[dry-run] would create shared directories and link Claude/Codex paths"
+    echo "[dry-run] would ensure qmd MCP config in ~/.claude/settings.json and ~/.codex/config.toml"
+    echo "[dry-run] would ensure qmd collection + context + update/embed"
+    return
+  fi
+
+  safe_mkdir "$shared_project_dir"
+  safe_mkdir "$shared_project_dir/sessions"
+  safe_mkdir "$shared_project_dir/decisions"
+  safe_mkdir "$shared_project_dir/patterns"
+  safe_mkdir "$shared_project_dir/bugs"
+
+  if [[ ! -f "$shared_project_dir/MEMORY.md" ]]; then
+    cat >"$shared_project_dir/MEMORY.md" <<EOF
+# Shared Memory: $project_name
+
+This directory is shared by Claude Code and Codex through qmd.
+
+## Query
+- qmd search "query" -c $project_name
+- qmd vsearch "query" -c $project_name
+- qmd query "query" -c $project_name
+
+## Write
+Add markdown files under:
+- sessions/
+- decisions/
+- patterns/
+- bugs/
+
+Then run:
+- qmd update
+- qmd embed
+EOF
+  fi
+
+  link_to_shared "$claude_project_dir" "$shared_project_dir"
+  link_to_shared "$codex_project_dir" "$shared_project_dir"
+
+  ensure_claude_settings "$DEFAULT_CLAUDE_HOME/settings.json"
+  ensure_codex_settings "$DEFAULT_CODEX_HOME/config.toml"
+
+  ensure_collection "$(slugify "$project_name")" "$shared_project_dir" "$project_name" "$skip_embed"
+
+  echo "Bridge setup complete."
+}
+
+cmd_write() {
+  local project_arg=""
+  local shared_root="$DEFAULT_SHARED_ROOT"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        project_arg="${2:-}"
+        shift 2
+        ;;
+      --shared-root)
+        shared_root="${2:-}"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  local project_name summary
+  project_name="$(derive_project_name "$project_arg")"
+  shared_root="$(abs_realpath "$shared_root")"
+  summary="$*"
+  write_memory_note "$project_name" "$shared_root" "$summary"
+}
+
+cmd_query() {
+  local project_arg=""
+  local query=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        project_arg="${2:-}"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        query="$*"
+        break
+        ;;
+    esac
+  done
+
+  [[ -n "$query" ]] || die "query requires a search string"
+  require_cmd qmd
+
+  local collection
+  collection="$(slugify "$(derive_project_name "$project_arg")")"
+  if qmd ls "$collection" >/dev/null 2>&1; then
+    qmd query "$query" -c "$collection"
+  else
+    qmd query "$query"
+  fi
+}
+
+cmd_status() {
+  local project_arg=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        project_arg="${2:-}"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown status option: $1"
+        ;;
+    esac
+  done
+
+  local project_name
+  project_name="$(derive_project_name "$project_arg")"
+  local shared_project_dir claude_project_dir codex_project_dir
+  shared_project_dir="$(abs_realpath "$DEFAULT_SHARED_ROOT")/$project_name"
+  claude_project_dir="$DEFAULT_CLAUDE_HOME/knowledge/$project_name"
+  codex_project_dir="$DEFAULT_CODEX_HOME/knowledge/$project_name"
+
+  echo "Project: $project_name"
+  echo "Shared: $shared_project_dir"
+  if [[ -L "$claude_project_dir" ]]; then
+    echo "Claude: $claude_project_dir -> $(readlink "$claude_project_dir")"
+  else
+    echo "Claude: $claude_project_dir"
+  fi
+  if [[ -L "$codex_project_dir" ]]; then
+    echo "Codex:  $codex_project_dir -> $(readlink "$codex_project_dir")"
+  else
+    echo "Codex:  $codex_project_dir"
+  fi
+
+  if command -v qmd >/dev/null 2>&1; then
+    echo ""
+    qmd status
+  else
+    echo "qmd not installed"
+  fi
+}
+
+cmd_ingest() {
+  local project_arg=""
+  local shared_root="$DEFAULT_SHARED_ROOT"
+  local skip_embed="0"
+  local print_json="0"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        project_arg="${2:-}"
+        shift 2
+        ;;
+      --shared-root)
+        shared_root="${2:-}"
+        shift 2
+        ;;
+      --skip-embed)
+        skip_embed="1"
+        shift
+        ;;
+      --json)
+        print_json="1"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown ingest option: $1"
+        ;;
+    esac
+  done
+
+  require_cmd qmd
+  require_cmd python3
+
+  local project_name shared_project_dir collection_name state_file script_dir_path ingest_script
+  project_name="$(derive_project_name "$project_arg")"
+  shared_root="$(abs_realpath "$shared_root")"
+  shared_project_dir="$shared_root/$project_name"
+  collection_name="$(slugify "$project_name")"
+  state_file="$(abs_realpath "$DEFAULT_STATE_ROOT")/$project_name.json"
+  script_dir_path="$(script_dir)"
+  ingest_script="$script_dir_path/ingest_sessions.py"
+  [[ -f "$ingest_script" ]] || die "ingest helper not found: $ingest_script"
+
+  safe_mkdir "$shared_project_dir"
+  safe_mkdir "$(dirname "$state_file")"
+
+  if ! qmd ls "$collection_name" >/dev/null 2>&1; then
+    ensure_collection "$collection_name" "$shared_project_dir" "$project_name" "1"
+  fi
+
+  local ingest_json
+  ingest_json="$(python3 "$ingest_script" \
+    --project "$project_name" \
+    --shared-root "$shared_root" \
+    --state-file "$state_file" \
+    --codex-home "$DEFAULT_CODEX_HOME" \
+    --claude-home "$DEFAULT_CLAUDE_HOME")"
+
+  local codex_written claude_written total_written
+  codex_written="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["codex"]["written"])' <<<"$ingest_json")"
+  claude_written="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["claude"]["written"])' <<<"$ingest_json")"
+  total_written=$((codex_written + claude_written))
+
+  if (( total_written > 0 )); then
+    qmd update
+    if [[ "$skip_embed" != "1" ]]; then
+      qmd embed || true
+    fi
+  fi
+
+  if [[ "$print_json" == "1" ]]; then
+    echo "$ingest_json"
+  else
+    echo "Ingested project: $project_name"
+    echo "Codex sessions imported: $codex_written"
+    echo "Claude sessions updated: $claude_written"
+    echo "State file: $state_file"
+    if (( total_written == 0 )); then
+      echo "No new session data found."
+    fi
+  fi
+}
+
+cmd_install() {
+  local project_arg=""
+  local shared_root="$DEFAULT_SHARED_ROOT"
+  local use_icloud="1"
+  local icloud_root="$DEFAULT_ICLOUD_ROOT"
+  local interval_minutes="$DEFAULT_LAUNCH_INTERVAL_MINUTES"
+  local skip_embed="0"
+  local no_launch_agent="0"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        project_arg="${2:-}"
+        shift 2
+        ;;
+      --shared-root)
+        shared_root="${2:-}"
+        shift 2
+        ;;
+      --icloud)
+        use_icloud="1"
+        shift
+        ;;
+      --no-icloud)
+        use_icloud="0"
+        shift
+        ;;
+      --icloud-root)
+        icloud_root="${2:-}"
+        shift 2
+        ;;
+      --interval-minutes)
+        interval_minutes="${2:-}"
+        shift 2
+        ;;
+      --skip-embed)
+        skip_embed="1"
+        shift
+        ;;
+      --no-launch-agent)
+        no_launch_agent="1"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown install option: $1"
+        ;;
+    esac
+  done
+
+  [[ "$interval_minutes" =~ ^[0-9]+$ ]] || die "--interval-minutes must be a number"
+  (( interval_minutes >= 1 )) || die "--interval-minutes must be >= 1"
+
+  local project_name cli_path
+  project_name="$(derive_project_name "$project_arg")"
+  shared_root="$(abs_realpath "$shared_root")"
+  cli_path="$(script_path)"
+
+  "$cli_path" setup --project "$project_name" --shared-root "$shared_root" --skip-embed
+
+  if [[ "$use_icloud" == "1" ]]; then
+    "$cli_path" icloud-enable --project "$project_name" --shared-root "$shared_root" --icloud-root "$icloud_root" --skip-embed
+  fi
+
+  if [[ "$skip_embed" == "1" ]]; then
+    "$cli_path" ingest --project "$project_name" --shared-root "$shared_root" --skip-embed
+  else
+    "$cli_path" ingest --project "$project_name" --shared-root "$shared_root"
+  fi
+  install_instruction_blocks "$project_name" "$shared_root" "$cli_path"
+
+  safe_mkdir "$HOME/.local/bin"
+  ln -sf "$cli_path" "$HOME/.local/bin/total-recall"
+
+  if [[ "$no_launch_agent" != "1" ]]; then
+    install_launch_agent "$project_name" "$shared_root" "$cli_path" "$interval_minutes"
+  fi
+
+  echo "Install complete."
+  echo "Project: $project_name"
+  echo "CLI link: $HOME/.local/bin/total-recall"
+}
+
+cmd_icloud_enable() {
+  local project_arg=""
+  local shared_root="$DEFAULT_SHARED_ROOT"
+  local icloud_root="$DEFAULT_ICLOUD_ROOT"
+  local skip_embed="0"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        project_arg="${2:-}"
+        shift 2
+        ;;
+      --shared-root)
+        shared_root="${2:-}"
+        shift 2
+        ;;
+      --icloud-root)
+        icloud_root="${2:-}"
+        shift 2
+        ;;
+      --skip-embed)
+        skip_embed="1"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown icloud-enable option: $1"
+        ;;
+    esac
+  done
+
+  require_icloud_drive
+
+  local project_name local_project cloud_project
+  project_name="$(derive_project_name "$project_arg")"
+  shared_root="$(abs_realpath "$shared_root")"
+  icloud_root="$(abs_realpath "$icloud_root")"
+  local_project="$shared_root/$project_name"
+  cloud_project="$icloud_root/$project_name"
+
+  echo "Project: $project_name"
+  echo "Local shared path: $local_project"
+  echo "iCloud path: $cloud_project"
+
+  safe_mkdir "$shared_root"
+  safe_mkdir "$icloud_root"
+  safe_mkdir "$cloud_project"
+
+  if [[ ! -e "$local_project" ]]; then
+    safe_mkdir "$local_project"
+    safe_mkdir "$local_project/sessions"
+    safe_mkdir "$local_project/decisions"
+    safe_mkdir "$local_project/patterns"
+    safe_mkdir "$local_project/bugs"
+  fi
+
+  if [[ -d "$local_project" && ! -L "$local_project" ]]; then
+    sync_dirs_ignore_existing "$local_project" "$cloud_project"
+    sync_dirs_ignore_existing "$cloud_project" "$local_project"
+    local backup
+    backup="$(backup_name "$local_project")"
+    mv "$local_project" "$backup"
+    echo "Backed up local project dir -> $backup"
+    ln -s "$cloud_project" "$local_project"
+  elif [[ -L "$local_project" ]]; then
+    local resolved_current resolved_cloud
+    resolved_current="$(resolve_link_target "$local_project")"
+    resolved_cloud="$(abs_realpath "$cloud_project")"
+    if [[ "$resolved_current" != "$resolved_cloud" ]]; then
+      rm -f "$local_project"
+      ln -s "$cloud_project" "$local_project"
+    fi
+  else
+    ln -s "$cloud_project" "$local_project"
+  fi
+
+  local claude_project_dir codex_project_dir
+  claude_project_dir="$DEFAULT_CLAUDE_HOME/knowledge/$project_name"
+  codex_project_dir="$DEFAULT_CODEX_HOME/knowledge/$project_name"
+  link_to_shared "$claude_project_dir" "$local_project"
+  link_to_shared "$codex_project_dir" "$local_project"
+
+  ensure_collection "$(slugify "$project_name")" "$local_project" "$project_name" "$skip_embed"
+
+  echo "iCloud live backup enabled."
+}
+
+cmd_icloud_sync() {
+  local project_arg=""
+  local shared_root="$DEFAULT_SHARED_ROOT"
+  local icloud_root="$DEFAULT_ICLOUD_ROOT"
+  local direction="both"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        project_arg="${2:-}"
+        shift 2
+        ;;
+      --shared-root)
+        shared_root="${2:-}"
+        shift 2
+        ;;
+      --icloud-root)
+        icloud_root="${2:-}"
+        shift 2
+        ;;
+      --direction)
+        direction="${2:-}"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown icloud-sync option: $1"
+        ;;
+    esac
+  done
+
+  case "$direction" in
+    push|pull|both) ;;
+    *) die "--direction must be push, pull, or both" ;;
+  esac
+
+  require_icloud_drive
+
+  local project_name local_project cloud_project
+  project_name="$(derive_project_name "$project_arg")"
+  shared_root="$(abs_realpath "$shared_root")"
+  icloud_root="$(abs_realpath "$icloud_root")"
+  local_project="$shared_root/$project_name"
+  cloud_project="$icloud_root/$project_name"
+
+  [[ -d "$local_project" || -L "$local_project" ]] || die "Local shared project not found: $local_project"
+  [[ -d "$cloud_project" ]] || safe_mkdir "$cloud_project"
+
+  if [[ "$direction" == "push" || "$direction" == "both" ]]; then
+    sync_dirs_mirror "$local_project" "$cloud_project"
+  fi
+  if [[ "$direction" == "pull" || "$direction" == "both" ]]; then
+    sync_dirs_mirror "$cloud_project" "$local_project"
+  fi
+
+  qmd update
+  echo "iCloud sync complete ($direction)."
+}
+
+cmd_icloud_status() {
+  local project_arg=""
+  local shared_root="$DEFAULT_SHARED_ROOT"
+  local icloud_root="$DEFAULT_ICLOUD_ROOT"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --project)
+        project_arg="${2:-}"
+        shift 2
+        ;;
+      --shared-root)
+        shared_root="${2:-}"
+        shift 2
+        ;;
+      --icloud-root)
+        icloud_root="${2:-}"
+        shift 2
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown icloud-status option: $1"
+        ;;
+    esac
+  done
+
+  local project_name local_project cloud_project
+  project_name="$(derive_project_name "$project_arg")"
+  shared_root="$(abs_realpath "$shared_root")"
+  icloud_root="$(abs_realpath "$icloud_root")"
+  local_project="$shared_root/$project_name"
+  cloud_project="$icloud_root/$project_name"
+
+  echo "Project: $project_name"
+  echo "Local shared: $local_project"
+  if [[ -L "$local_project" ]]; then
+    echo "Local shared link target: $(resolve_link_target "$local_project")"
+  fi
+  echo "iCloud: $cloud_project"
+
+  if [[ -d "$local_project" || -L "$local_project" ]]; then
+    echo "Local files: $(find -L "$local_project" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  else
+    echo "Local files: path missing"
+  fi
+  if [[ -d "$cloud_project" ]]; then
+    echo "iCloud files: $(find "$cloud_project" -type f 2>/dev/null | wc -l | tr -d ' ')"
+  else
+    echo "iCloud files: path missing"
+  fi
+}
+
+main() {
+  local cmd="${1:-}"
+  if [[ -z "$cmd" ]]; then
+    usage
+    exit 1
+  fi
+  shift || true
+
+  case "$cmd" in
+    setup) cmd_setup "$@" ;;
+    write) cmd_write "$@" ;;
+    query) cmd_query "$@" ;;
+    status) cmd_status "$@" ;;
+    ingest) cmd_ingest "$@" ;;
+    install) cmd_install "$@" ;;
+    icloud-enable) cmd_icloud_enable "$@" ;;
+    icloud-sync) cmd_icloud_sync "$@" ;;
+    icloud-status) cmd_icloud_status "$@" ;;
+    -h|--help|help) usage ;;
+    *) die "Unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"
