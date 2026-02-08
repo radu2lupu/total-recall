@@ -1,5 +1,4 @@
 {
-  "description": "Total Recall stop hook to remind about saving session memory",
   "hooks": {
     "Stop": [
       {
