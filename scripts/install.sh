@@ -11,7 +11,7 @@ if ! command -v qmd >/dev/null 2>&1; then
     exit 1
   fi
   echo "Installing qmd..."
-  bun install -g qmd
+  bun install -g github:tobi/qmd
 fi
 
 chmod +x "$CLI"

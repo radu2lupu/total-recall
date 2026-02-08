@@ -31,7 +31,7 @@ Then re-run /memory-setup
 
 If `bun` is available but `qmd` is not, install it:
 ```bash
-bun install -g qmd
+bun install -g github:tobi/qmd
 ```
 
 ### 2. Ask the user (interactive)
