@@ -63,7 +63,5 @@ Where `<plugin-root>` is the Plugin root from context above. Run it and let the 
 
 Tell the user:
 - Setup is complete
-- How to write memory: `/memory-write` or `total-recall write --project <name> "summary"`
-- How to query memory: `total-recall query --project <name> "query"`
-- That the Stop hook will remind them to save memory when ending sessions
-- That `/memory-rebuild` can backfill memory from git history
+- Memory is fully automatic — Claude will query past memories at session start and save new ones at session end, no manual commands needed
+- `/memory-rebuild` can optionally backfill memory from git history if they want to seed it with past work

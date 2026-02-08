@@ -193,13 +193,14 @@ install_instruction_blocks() {
   local block
   block=$(cat <<EOF
 ## Total Recall Auto-Memory ($project_name)
-- At session start, automatically query memory before planning work:
-  - \`$cli_path query --project $project_name "<task context>"\`
-- During and after non-trivial work, automatically persist memory:
-  - \`$cli_path write --project $project_name "<what changed and why>"\`
-- Keep memory fresh from raw logs:
-  - \`$cli_path ingest --project $project_name --shared-root $shared_root\`
-- Use qmd memory search first when prior context could help.
+IMPORTANT: You MUST do these automatically — the user should never have to ask.
+- **Session start**: Before planning any work, query memory for relevant context:
+  - \`$cli_path query --project $project_name "<brief description of the task>"\`
+  - If results are relevant, use them to inform your approach.
+- **Session end**: After any non-trivial work, persist what you learned:
+  - \`$cli_path write --project $project_name "<concise summary of what changed and why>"\`
+- **Mid-session**: When you encounter a problem where prior context could help, query memory first.
+- Do NOT tell the user to run these commands manually. This is your job.
 EOF
 )
 
