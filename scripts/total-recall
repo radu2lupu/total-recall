@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ensure bun-installed globals (like qmd) are on PATH
+for p in "$HOME/.bun/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
+  [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
+done
+
 DEFAULT_SHARED_ROOT="${TOTAL_RECALL_SHARED_ROOT:-$HOME/.ai-memory/knowledge}"
 DEFAULT_CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
 DEFAULT_CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
