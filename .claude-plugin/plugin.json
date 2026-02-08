@@ -8,17 +8,5 @@
   "homepage": "https://github.com/radu2lupu/total-recall",
   "repository": "https://github.com/radu2lupu/total-recall",
   "license": "MIT",
-  "keywords": ["memory", "knowledge", "semantic-search", "sessions", "qmd"],
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-summary-reminder.sh"
-          }
-        ]
-      }
-    ]
-  }
+  "keywords": ["memory", "knowledge", "semantic-search", "sessions", "qmd"]
 }

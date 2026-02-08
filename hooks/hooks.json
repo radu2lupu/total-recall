@@ -1,0 +1,15 @@
+{
+  "description": "Total Recall stop hook to remind about saving session memory",
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-summary-reminder.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
