@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "total-recall",
-      "source": ".",
+      "source": "./",
       "description": "Cross-session semantic memory for Claude Code. Provides knowledge persistence via BM25 + vector search using qmd.",
       "version": "1.0.0",
       "author": {
