@@ -1,5 +1,17 @@
 {
+  "description": "Total Recall: cross-session memory persistence via qmd",
   "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/hooks/session-start-query.sh",
+            "statusMessage": "Loading session memory..."
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "hooks": [

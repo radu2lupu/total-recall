@@ -191,18 +191,36 @@ install_instruction_blocks() {
   local end_marker="<!-- total-recall:auto:end -->"
 
   local block
-  block=$(cat <<EOF
-## Total Recall Auto-Memory ($project_name)
-IMPORTANT: You MUST do these automatically — the user should never have to ask.
-- **Session start**: Before planning any work, query memory for relevant context:
-  - \`$cli_path query --project $project_name "<brief description of the task>"\`
-  - If results are relevant, use them to inform your approach.
-- **Session end**: After any non-trivial work, persist what you learned:
-  - \`$cli_path write --project $project_name "<concise summary of what changed and why>"\`
-- **Mid-session**: When you encounter a problem where prior context could help, query memory first.
-- Do NOT tell the user to run these commands manually. This is your job.
-EOF
-)
+  block="## Total Recall Auto-Memory ($project_name)
+
+### MANDATORY — your FIRST action every session
+Before reading files, before planning, before responding to the user request —
+run this command to load context from prior sessions:
+\`\`\`
+$cli_path query --project $project_name \"<what the user is asking about>\"
+\`\`\`
+This is not optional. Skipping it means you will repeat past mistakes, re-explore
+already-investigated code, and miss decisions that were already made. The query
+takes seconds but saves entire conversations of wasted work.
+
+### MANDATORY — after completing non-trivial work
+When you finish implementing a feature, fixing a bug, making a design decision,
+or learning something that would help a future session, persist it:
+\`\`\`
+$cli_path write --project $project_name \"<concise summary: what changed, why, and what you learned>\"
+\`\`\`
+
+### When to query mid-session
+- Before choosing between multiple valid approaches (prior sessions may have already tried one)
+- When you hit an unexpected error (it may have been solved before)
+- When the user references something from a previous session
+
+### When NOT to query
+- You already queried at session start and are mid-task with full context
+- The task is trivial (fixing a typo, adding a log statement)
+- The user gave you everything you need in their message
+
+Do NOT tell the user to run these commands manually. This is YOUR responsibility."
 
   upsert_markdown_block "$claude_file" "$start_marker" "$end_marker" "$block"
   upsert_markdown_block "$codex_file" "$start_marker" "$end_marker" "$block"

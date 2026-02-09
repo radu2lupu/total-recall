@@ -59,6 +59,36 @@ The plugin commands are still available:
 ./scripts/total-recall install --project my-project --skip-embed
 ```
 
+## How It Enforces Consistent Memory Usage
+
+The hardest part of cross-session memory isn't the storage — it's getting Claude to
+actually **use** it every time. Total Recall uses three reinforcement layers:
+
+### 1. SessionStart hook (strongest signal)
+A `SessionStart` hook fires when every session begins and injects context telling
+Claude that its **first action** must be to run `total-recall query`. This fires before
+Claude even sees the user's first message, so there's no "eager to jump into the task"
+failure mode.
+
+### 2. CLAUDE.md instruction block
+The `install` command injects a detailed instruction block into `~/.claude/CLAUDE.md`
+explaining exactly **when** to query (session start, before design decisions) and
+**when not to** (mid-task with full context, trivial changes). Vague instructions like
+"query when helpful" don't work — Claude treats them as optional.
+
+### 3. Stop hook (session end)
+A `Stop` hook fires when Claude is about to finish and blocks it until it writes
+a memory summary. This ensures learnings are persisted, not lost. The hook checks
+`stop_hook_active` to prevent infinite loops — on the second firing it lets Claude end.
+
+### Why this matters
+Without these hooks, Claude consistently skips memory operations because:
+- The query "feels like a detour" before the real work (but it's actually a shortcut)
+- Writing memory at session end feels like cleanup that can be skipped
+- Vague instructions ("use memory when helpful") are interpreted as optional
+
+The hooks make it structural — Claude can't skip them even if it wants to.
+
 ## Notes
 
 - Ingestion state is stored at `~/.ai-memory/state/<project>.json`.

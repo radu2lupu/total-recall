@@ -1,10 +1,6 @@
 #!/bin/bash
+# SessionStart hook — tells Claude to query Total Recall before doing anything else.
 INPUT=$(cat)
-
-# Prevent infinite loop — if we already triggered a stop hook continuation, let it end
-if [ "$(echo "$INPUT" | jq -r '.stop_hook_active // false')" = "true" ]; then
-  exit 0
-fi
 
 # Get cwd from hook input (more reliable than $PWD in hook context)
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
@@ -33,9 +29,11 @@ KNOWLEDGE_DIR="$HOME/.ai-memory/knowledge/$PROJECT"
 
 if [ -d "$KNOWLEDGE_DIR" ] && command -v qmd >/dev/null 2>&1; then
   jq -n --arg cli "$CLI" --arg project "$PROJECT" '{
-    "decision": "block",
-    "reason": ("BEFORE STOPPING: You must persist what you learned this session. Run:\n`" + $cli + " write --project " + $project + " \"<concise summary: what changed, why, and what was learned>\"`\nThen you may stop. If this session was truly trivial (only reading files, no changes, no decisions), you may skip this — but explain why.")
+    "hookSpecificOutput": {
+      "hookEventName": "SessionStart",
+      "additionalContext": ("TOTAL RECALL MEMORY SYSTEM ACTIVE.\nYour FIRST action — before reading files, before planning, before anything — MUST be to query prior session memory:\n`" + $cli + " query --project " + $project + " \"<what the user is asking about>\"`\nThis retrieves context from all previous sessions. Without it, you will repeat past mistakes and miss prior decisions. This is mandatory, not optional.")
+    }
   }'
-else
-  exit 0
 fi
+
+exit 0
