@@ -143,6 +143,12 @@ script_path() {
   abs_realpath "${BASH_SOURCE[0]}"
 }
 
+canonical_cli_path() {
+  # The stable, predictable path that survives repo moves and plugin reinstalls.
+  # cmd_install() ensures this symlink always points to the real script.
+  printf '%s' "$HOME/.local/bin/total-recall"
+}
+
 upsert_markdown_block() {
   local file_path="$1"
   local start_marker="$2"
@@ -828,18 +834,23 @@ cmd_install() {
   else
     "$cli_path" ingest --project "$project_name" --shared-root "$shared_root"
   fi
-  install_instruction_blocks "$project_name" "$shared_root" "$cli_path"
-
+  # Create the stable symlink FIRST, so we can use it as the canonical path
   safe_mkdir "$HOME/.local/bin"
   ln -sf "$cli_path" "$HOME/.local/bin/total-recall"
 
+  # All persisted references use the canonical (stable) path
+  local canonical_path
+  canonical_path="$(canonical_cli_path)"
+
+  install_instruction_blocks "$project_name" "$shared_root" "$canonical_path"
+
   if [[ "$no_launch_agent" != "1" ]]; then
-    install_launch_agent "$project_name" "$shared_root" "$cli_path" "$interval_minutes"
+    install_launch_agent "$project_name" "$shared_root" "$canonical_path" "$interval_minutes"
   fi
 
   echo "Install complete."
   echo "Project: $project_name"
-  echo "CLI link: $HOME/.local/bin/total-recall"
+  echo "CLI link: $canonical_path"
 }
 
 cmd_icloud_enable() {
