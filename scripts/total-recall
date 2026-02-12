@@ -594,7 +594,10 @@ cmd_write() {
   project_name="$(derive_project_name "$project_arg")"
   shared_root="$(abs_realpath "$shared_root")"
   summary="$*"
-  write_memory_note "$project_name" "$shared_root" "$summary"
+  write_memory_note "$project_name" "$shared_root" "$summary" || {
+    echo "Could not write memory (filesystem may be read-only). Summary not persisted."
+    return 0
+  }
 }
 
 cmd_query() {
@@ -618,14 +621,24 @@ cmd_query() {
   done
 
   [[ -n "$query" ]] || die "query requires a search string"
-  require_cmd qmd
+
+  if ! command -v qmd >/dev/null 2>&1; then
+    echo "No memory available (qmd not installed). Continuing without prior context."
+    return 0
+  fi
 
   local collection
   collection="$(slugify "$(derive_project_name "$project_arg")")"
   if qmd ls "$collection" >/dev/null 2>&1; then
-    qmd query "$query" -c "$collection"
+    qmd query "$query" -c "$collection" 2>/dev/null || {
+      echo "No memory available (qmd database not accessible — possibly a read-only environment). Continuing without prior context."
+      return 0
+    }
   else
-    qmd query "$query"
+    qmd query "$query" 2>/dev/null || {
+      echo "No memory available (qmd database not accessible — possibly a read-only environment). Continuing without prior context."
+      return 0
+    }
   fi
 }
 
