@@ -15,34 +15,52 @@ DEFAULT_LAUNCH_INTERVAL_MINUTES="${TOTAL_RECALL_SYNC_INTERVAL_MINUTES:-15}"
 
 usage() {
   cat <<'EOF'
-total-recall: shared qmd memory bridge for Claude + Codex
+total-recall: persistent cross-session memory for Claude Code
 
 Usage:
-  total-recall setup [--project NAME] [--shared-root PATH] [--skip-embed] [--dry-run]
-  total-recall write "<summary>" [--project NAME] [--shared-root PATH]
-  total-recall query "<query>" [--project NAME]
-  total-recall status [--project NAME]
-  total-recall ingest [--project NAME] [--shared-root PATH] [--skip-embed] [--json]
-  total-recall install [--project NAME] [--shared-root PATH] [--icloud|--no-icloud] [--icloud-root PATH] [--interval-minutes N] [--skip-embed] [--no-launch-agent]
-  total-recall icloud-enable [--project NAME] [--shared-root PATH] [--icloud-root PATH] [--skip-embed]
-  total-recall icloud-sync [--project NAME] [--shared-root PATH] [--icloud-root PATH] [--direction push|pull|both]
-  total-recall icloud-status [--project NAME] [--shared-root PATH] [--icloud-root PATH]
+  total-recall install --project NAME [options]
+  total-recall write "<summary>" --project NAME
+  total-recall query "<query>" --project NAME
+  total-recall status --project NAME
+  total-recall ingest --project NAME
   total-recall server {init|start|stop|status|add-key|install-launchd}
   total-recall client {configure --server-url URL --api-key KEY|status|disable|enable}
 
-Notes:
-  - setup links both ~/.claude/knowledge/<project> and ~/.codex/knowledge/<project>
-    to one shared directory and configures qmd MCP for both tools.
-  - ingest imports Claude/Codex session logs into markdown memory automatically.
-  - install runs end-to-end setup + ingestion + instruction injection + background sync.
-  - icloud-enable moves the shared project memory to iCloud and symlinks local path to it.
-  - icloud-sync is a manual backup/restore sync helper.
-  - write creates a markdown session note and re-indexes qmd.
-  - query runs qmd hybrid search scoped to the project collection when possible.
-  - server runs the total-recall HTTP API for multi-machine memory sharing.
-  - client configures this machine to use a remote total-recall server.
-  When client is configured, write/query/ingest route to the server automatically.
-  Set TOTAL_RECALL_SERVER_URL and TOTAL_RECALL_API_KEY env vars to override config.
+Install modes:
+  Standalone (default):
+    total-recall install --project NAME
+    Sets up local memory, hooks, ingestion, iCloud backup, and background sync.
+
+  Server (host memory for multiple machines):
+    total-recall install --project NAME --server [--port PORT]
+    Full local setup + starts HTTP server with web UI + auto-start on boot.
+    Prints API key and connection instructions for client machines.
+
+  Client (connect to a remote server):
+    total-recall install --project NAME --client --server-url URL --api-key KEY
+    Lightweight setup: hooks + instruction injection only. No local qmd needed.
+    All write/query operations route to the server automatically.
+
+Install options:
+  --project NAME         Project name (or auto-detected from git remote)
+  --server               Server mode: also starts HTTP API + web UI
+  --client               Client mode: connect to remote server (no local qmd)
+  --server-url URL       Server URL (required with --client)
+  --api-key KEY          API key (required with --client)
+  --port PORT            Server port (default: 7899, only with --server)
+  --no-icloud            Skip iCloud backup
+  --no-launch-agent      Skip background sync agent
+  --interval-minutes N   Background sync interval (default: 15)
+  --skip-embed           Skip vector embeddings during setup
+
+Other commands:
+  setup      Link dirs + configure qmd (no ingestion)
+  ingest     Import Claude/Codex session logs
+  icloud-enable/sync/status   Manage iCloud backup
+
+Environment variables:
+  TOTAL_RECALL_SERVER_URL   Override client server URL
+  TOTAL_RECALL_API_KEY      Override client API key
 EOF
 }
 
@@ -908,6 +926,10 @@ cmd_install() {
   local interval_minutes="$DEFAULT_LAUNCH_INTERVAL_MINUTES"
   local skip_embed="0"
   local no_launch_agent="0"
+  local install_mode="standalone"  # standalone | server | client
+  local server_url=""
+  local api_key=""
+  local server_port=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -943,6 +965,26 @@ cmd_install() {
         no_launch_agent="1"
         shift
         ;;
+      --server)
+        install_mode="server"
+        shift
+        ;;
+      --client)
+        install_mode="client"
+        shift
+        ;;
+      --server-url)
+        server_url="${2:-}"
+        shift 2
+        ;;
+      --api-key)
+        api_key="${2:-}"
+        shift 2
+        ;;
+      --port)
+        server_port="${2:-}"
+        shift 2
+        ;;
       --help|-h)
         usage
         exit 0
@@ -953,13 +995,50 @@ cmd_install() {
     esac
   done
 
-  [[ "$interval_minutes" =~ ^[0-9]+$ ]] || die "--interval-minutes must be a number"
-  (( interval_minutes >= 1 )) || die "--interval-minutes must be >= 1"
+  # Validate mode-specific requirements
+  if [[ "$install_mode" == "client" ]]; then
+    [[ -n "$server_url" ]] || die "--client requires --server-url URL"
+    [[ -n "$api_key" ]] || die "--client requires --api-key KEY"
+  fi
 
   local project_name cli_path
   project_name="$(derive_project_name "$project_arg")"
-  shared_root="$(abs_realpath "$shared_root")"
   cli_path="$(script_path)"
+
+  # Create the stable symlink (needed for all modes)
+  safe_mkdir "$HOME/.local/bin"
+  ln -sf "$cli_path" "$HOME/.local/bin/total-recall"
+  local canonical_path
+  canonical_path="$(canonical_cli_path)"
+
+  if [[ "$install_mode" == "client" ]]; then
+    # --- Client-only install: no local qmd, no local dirs ---
+    echo "Installing in client mode..."
+    echo "Project: $project_name"
+
+    # Configure the client connection
+    "$cli_path" client configure --server-url "$server_url" --api-key "$api_key"
+
+    # Inject instruction blocks (uses canonical path for stability)
+    install_instruction_blocks "$project_name" "$shared_root" "$canonical_path"
+
+    echo ""
+    echo "Client install complete."
+    echo "  Project:    $project_name"
+    echo "  Server:     $server_url"
+    echo "  CLI link:   $canonical_path"
+    echo "  Web UI:     $server_url/"
+    echo ""
+    echo "All write/query operations route to the server."
+    echo "Claude Code hooks are active — memory query at session start, write at session end."
+    return 0
+  fi
+
+  # --- Standalone or Server mode: full local setup ---
+  [[ "$interval_minutes" =~ ^[0-9]+$ ]] || die "--interval-minutes must be a number"
+  (( interval_minutes >= 1 )) || die "--interval-minutes must be >= 1"
+
+  shared_root="$(abs_realpath "$shared_root")"
 
   "$cli_path" setup --project "$project_name" --shared-root "$shared_root" --skip-embed
 
@@ -972,13 +1051,6 @@ cmd_install() {
   else
     "$cli_path" ingest --project "$project_name" --shared-root "$shared_root"
   fi
-  # Create the stable symlink FIRST, so we can use it as the canonical path
-  safe_mkdir "$HOME/.local/bin"
-  ln -sf "$cli_path" "$HOME/.local/bin/total-recall"
-
-  # All persisted references use the canonical (stable) path
-  local canonical_path
-  canonical_path="$(canonical_cli_path)"
 
   install_instruction_blocks "$project_name" "$shared_root" "$canonical_path"
 
@@ -986,9 +1058,58 @@ cmd_install() {
     install_launch_agent "$project_name" "$shared_root" "$canonical_path" "$interval_minutes"
   fi
 
+  echo ""
   echo "Install complete."
   echo "Project: $project_name"
   echo "CLI link: $canonical_path"
+
+  if [[ "$install_mode" == "server" ]]; then
+    # --- Server mode: also init + launchd ---
+    echo ""
+    echo "Setting up server..."
+
+    # Only init if not already configured
+    local config_path="$HOME/.ai-memory/server.json"
+    if [[ ! -f "$config_path" ]]; then
+      "$cli_path" server init
+    else
+      echo "Server already initialized (using existing config)."
+    fi
+
+    # Apply custom port if specified
+    if [[ -n "$server_port" ]]; then
+      python3 - "$config_path" "$server_port" <<'PY'
+import json, sys
+path, port = sys.argv[1], int(sys.argv[2])
+with open(path) as f:
+    config = json.load(f)
+config["port"] = port
+with open(path, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+print(f"Server port set to {port}")
+PY
+    fi
+
+    # Install launchd agent (keeps server running across reboots)
+    "$cli_path" server install-launchd
+
+    # Read the config to show connection info
+    local port api_key_display
+    port="$(python3 -c "import json; print(json.load(open('$config_path')).get('port', 7899))")"
+    api_key_display="$(python3 -c "import json; keys=json.load(open('$config_path')).get('api_keys',[]); print(keys[0] if keys else 'none')")"
+
+    echo ""
+    echo "=== Server ready ==="
+    echo "  API:     http://0.0.0.0:$port/api/v1/"
+    echo "  Web UI:  http://0.0.0.0:$port/"
+    echo "  API key: $api_key_display"
+    echo ""
+    echo "On other machines, run:"
+    echo "  total-recall install --project $project_name --client \\"
+    echo "    --server-url http://<this-machine>:$port \\"
+    echo "    --api-key $api_key_display"
+  fi
 }
 
 cmd_icloud_enable() {

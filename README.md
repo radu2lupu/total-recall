@@ -55,57 +55,72 @@ Each memory file contains structured metadata — date, machine, project, topic 
 
 ## Multi-Machine Setup
 
-Share memories across machines on the same network using the built-in HTTP server.
+Share memories across machines on the same network using the built-in HTTP server. One command per machine.
 
 ### On the server machine
 
 ```bash
-total-recall server init          # Generate API key
-total-recall server start         # Start on port 7899
-total-recall server install-launchd  # Auto-start on boot (macOS)
+./scripts/install.sh --project my-project --server
 ```
+
+This does everything: local memory setup, iCloud backup, session ingestion, hooks, **and** starts an HTTP server on port 7899 with auto-restart on boot. It prints the API key and client connection command.
 
 ### On client machines
 
 ```bash
-total-recall client configure \
+./scripts/install.sh --project my-project --client \
   --server-url http://server.tailscale:7899 \
   --api-key tr_sk_...
-
-total-recall client status        # Verify connection
 ```
 
-Once configured, all `write`, `query`, and `ingest` commands route to the server automatically. If the server is unreachable, operations fall back to local qmd.
+Client installs are lightweight — no local qmd or memory directories needed. Just the CLI, hooks, and instruction injection. All `write` and `query` operations route to the server automatically.
 
 ### Web UI
 
 The server includes a web UI at `http://server:7899/` for browsing, viewing, editing, and deleting memories. Memories are grouped by project with metadata pills showing date, machine, and source tool.
 
+### Manual server/client commands
+
+For more control, the individual commands are still available:
+
+```bash
+total-recall server init              # Generate config + API key
+total-recall server start             # Start server manually
+total-recall server stop              # Stop server
+total-recall server status            # Check server status
+total-recall server add-key           # Generate additional API key
+total-recall server install-launchd   # Auto-start on boot (macOS)
+
+total-recall client configure --server-url URL --api-key KEY
+total-recall client status            # Check connection
+total-recall client enable            # Re-enable remote mode
+total-recall client disable           # Switch back to local mode
+```
+
 ## All Commands
 
 ```
-total-recall install    --project NAME   Full setup: shared dirs, symlinks, qmd, hooks, ingestion
-total-recall write      --project NAME   "<summary>"  Write a memory note
-total-recall query      --project NAME   "<query>"    Semantic search across memories
-total-recall ingest     --project NAME   Import Claude/Codex session logs
-total-recall status     --project NAME   Show memory stats and configuration
-total-recall setup      --project NAME   Link dirs + configure qmd (no ingestion)
+# Install (three modes)
+total-recall install --project NAME                    Standalone: full local setup
+total-recall install --project NAME --server            Server: local + HTTP API + launchd
+total-recall install --project NAME --client --server-url URL --api-key KEY   Client: remote only
 
-total-recall icloud-enable   --project NAME   Move memory to iCloud Drive
-total-recall icloud-sync     --project NAME   Manual iCloud push/pull
-total-recall icloud-status   --project NAME   Check iCloud sync state
+# Core
+total-recall write   --project NAME "<summary>"        Write a memory note
+total-recall query   --project NAME "<query>"          Semantic search across memories
+total-recall ingest  --project NAME                    Import Claude/Codex session logs
+total-recall status  --project NAME                    Show memory stats and config
 
-total-recall server init              Generate server config + API key
-total-recall server start             Start HTTP API server
-total-recall server stop              Stop the server
-total-recall server status            Check if server is running
-total-recall server add-key           Generate additional API key
-total-recall server install-launchd   Auto-start on boot (macOS)
+# iCloud
+total-recall icloud-enable   --project NAME            Move memory to iCloud Drive
+total-recall icloud-sync     --project NAME            Manual iCloud push/pull
+total-recall icloud-status   --project NAME            Check iCloud sync state
 
-total-recall client configure         Connect to a remote server
-total-recall client status            Check client connection
-total-recall client enable            Re-enable remote mode
-total-recall client disable           Switch back to local mode
+# Server management
+total-recall server init / start / stop / status / add-key / install-launchd
+
+# Client management
+total-recall client configure / status / enable / disable
 ```
 
 ### Plugin Slash Commands
@@ -119,10 +134,18 @@ When installed as a Claude Code plugin:
 ## Install Options
 
 ```bash
+# Standalone options
 total-recall install --project my-project --no-icloud          # Skip iCloud backup
 total-recall install --project my-project --no-launch-agent    # Skip background sync
 total-recall install --project my-project --interval-minutes 10 # Sync every 10 min
 total-recall install --project my-project --skip-embed         # Skip vector embeddings
+
+# Server options
+total-recall install --project my-project --server --port 8080 # Custom port
+
+# Client (no local qmd or bun needed)
+total-recall install --project my-project --client \
+  --server-url http://server:7899 --api-key tr_sk_...
 ```
 
 ## Environment Variables
@@ -138,10 +161,15 @@ total-recall install --project my-project --skip-embed         # Skip vector emb
 
 ## Requirements
 
+**Standalone / Server:**
 - macOS (iCloud + launchd features are macOS-only; core memory works anywhere)
 - [bun](https://bun.sh) (for installing qmd)
 - [qmd](https://github.com/tobi/qmd) (installed automatically)
 - Python 3.8+ (for server and session ingestion)
+
+**Client only:**
+- Python 3.8+ (for CLI)
+- No bun or qmd needed — everything routes to the server
 
 ## License
 

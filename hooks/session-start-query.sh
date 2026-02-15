@@ -26,8 +26,10 @@ fi
 
 CLI="${CLAUDE_PLUGIN_ROOT}/scripts/total-recall"
 KNOWLEDGE_DIR="$HOME/.ai-memory/knowledge/$PROJECT"
+CLIENT_JSON="$HOME/.ai-memory/client.json"
 
-if [ -d "$KNOWLEDGE_DIR" ] && command -v qmd >/dev/null 2>&1; then
+# Activate if local qmd memory exists OR if a remote server is configured
+if { [ -d "$KNOWLEDGE_DIR" ] && command -v qmd >/dev/null 2>&1; } || [ -f "$CLIENT_JSON" ]; then
   jq -n --arg cli "$CLI" --arg project "$PROJECT" '{
     "hookSpecificOutput": {
       "hookEventName": "SessionStart",
