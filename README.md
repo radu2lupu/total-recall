@@ -14,7 +14,14 @@ Works on a single machine with iCloud backup, or across multiple machines via a 
 
 Then run `/memory-setup` inside any project to configure it.
 
-### Manual Install
+### npm
+
+```bash
+npm install -g total-recall-memory
+total-recall install --project my-project
+```
+
+### From source
 
 ```bash
 git clone https://github.com/radu2lupu/total-recall.git
