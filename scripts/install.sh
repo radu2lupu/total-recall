@@ -16,6 +16,7 @@ fi
 
 chmod +x "$CLI"
 chmod +x "$SCRIPT_DIR/ingest_sessions.py"
+chmod +x "$SCRIPT_DIR/total-recall-server"
 
 echo "Running automated install..."
 "$CLI" install "$@"

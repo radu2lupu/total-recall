@@ -1,0 +1,1206 @@
+#!/usr/bin/env python3
+"""total-recall HTTP API server — single-file, stdlib-only."""
+
+import argparse
+import http.server
+import json
+import os
+import re
+import secrets
+import signal
+import socketserver
+import subprocess
+import sys
+import threading
+from datetime import date, datetime, timezone
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs, unquote
+
+MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
+DEFAULT_PORT = 7899
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return re.sub(r"-+", "-", slug) or "memory"
+
+
+def machine_id() -> str:
+    try:
+        return subprocess.check_output(
+            ["scutil", "--get", "ComputerName"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        import socket
+        return socket.gethostname().split(".")[0] or "unknown"
+
+
+def load_config(path: str) -> dict:
+    with open(path) as f:
+        config = json.load(f)
+    config["shared_root"] = os.path.expanduser(
+        config.get("shared_root", "~/.ai-memory/knowledge")
+    )
+    return config
+
+
+def run_qmd(*args, timeout=120):
+    """Run a qmd command and return (returncode, stdout, stderr)."""
+    env = os.environ.copy()
+    for p in [
+        os.path.expanduser("~/.bun/bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+    ]:
+        if os.path.isdir(p) and p not in env.get("PATH", ""):
+            env["PATH"] = p + ":" + env.get("PATH", "")
+    try:
+        result = subprocess.run(
+            ["qmd", *args],
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        return result.returncode, result.stdout, result.stderr
+    except FileNotFoundError:
+        return 1, "", "qmd not found"
+    except subprocess.TimeoutExpired:
+        return 1, "", "qmd timed out"
+
+
+def safe_rel_path(rel_path: str) -> str | None:
+    """Validate and normalize a relative path. Returns None if unsafe."""
+    if not rel_path:
+        return None
+    safe = os.path.normpath(rel_path)
+    if safe.startswith("..") or os.path.isabs(safe):
+        return None
+    return safe
+
+
+def is_project_dir(shared_root: str, name: str) -> bool:
+    """Check if a name is a valid project directory."""
+    dpath = os.path.join(shared_root, name)
+    return (
+        os.path.isdir(dpath)
+        and not name.startswith(".")
+        and not name.endswith(".backup")
+    )
+
+
+# ---------------------------------------------------------------------------
+# Web UI HTML
+# ---------------------------------------------------------------------------
+
+WEB_UI_HTML = """\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Total Recall</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--text2:#86868b;
+  --accent:#0071e3;--red:#ff3b30;--border:#d2d2d7;
+  --radius:12px;--shadow:0 1px 3px rgba(0,0,0,.08);
+  --font:-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',sans-serif;
+  --mono:'SF Mono',Menlo,Monaco,monospace;
+}
+html{font-family:var(--font);font-size:15px;line-height:1.5;color:var(--text);background:var(--bg)}
+body{min-height:100dvh}
+a{color:var(--accent);text-decoration:none}
+a:hover{text-decoration:underline}
+
+/* top bar */
+.topbar{
+  position:sticky;top:0;z-index:100;
+  background:rgba(245,245,247,.72);backdrop-filter:blur(20px);-webkit-backdrop-filter:blur(20px);
+  border-bottom:1px solid var(--border);padding:12px 20px;
+  display:flex;align-items:center;justify-content:space-between;
+}
+.topbar h1{font-size:17px;font-weight:600;letter-spacing:-.01em}
+.topbar .right{display:flex;align-items:center;gap:12px;font-size:13px;color:var(--text2)}
+.topbar .machine{background:rgba(0,0,0,.05);padding:2px 8px;border-radius:6px;font-size:12px}
+.topbar button{background:none;border:none;color:var(--accent);cursor:pointer;font:inherit;font-size:13px}
+
+/* layout */
+.container{max-width:720px;margin:0 auto;padding:20px}
+.breadcrumb{font-size:13px;color:var(--text2);margin-bottom:16px;display:flex;flex-wrap:wrap;gap:4px}
+.breadcrumb a{color:var(--text2)}
+.breadcrumb span{color:var(--text2)}
+
+/* cards */
+.card{
+  background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);
+  padding:16px;margin-bottom:12px;cursor:pointer;transition:box-shadow .15s;
+  border:1px solid rgba(0,0,0,.04);
+}
+.card:hover{box-shadow:0 2px 8px rgba(0,0,0,.12)}
+.card h3{font-size:16px;font-weight:600;margin-bottom:4px}
+.card .meta{font-size:12px;color:var(--text2);display:flex;gap:12px;flex-wrap:wrap}
+.card .meta .pill{background:rgba(0,0,0,.05);padding:1px 7px;border-radius:5px}
+
+/* file view */
+.file-header{margin-bottom:16px}
+.file-header h2{font-size:22px;font-weight:600;margin-bottom:8px}
+.meta-pills{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
+.meta-pills .pill{
+  background:rgba(0,113,227,.08);color:var(--accent);
+  padding:3px 10px;border-radius:6px;font-size:12px;font-weight:500;
+}
+.toolbar{display:flex;gap:8px;margin-bottom:16px}
+
+/* buttons */
+.btn{
+  display:inline-flex;align-items:center;gap:6px;
+  padding:8px 16px;border-radius:8px;border:none;
+  font:inherit;font-size:14px;font-weight:500;cursor:pointer;transition:opacity .15s;
+}
+.btn:hover{opacity:.85}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-secondary{background:rgba(0,0,0,.06);color:var(--text)}
+.btn-danger{background:var(--red);color:#fff}
+.btn-sm{padding:6px 12px;font-size:13px}
+
+/* markdown content */
+.md-content{
+  background:var(--card);border-radius:var(--radius);box-shadow:var(--shadow);
+  padding:24px;border:1px solid rgba(0,0,0,.04);
+}
+.md-content h1{font-size:22px;font-weight:600;margin:20px 0 8px}
+.md-content h2{font-size:18px;font-weight:600;margin:20px 0 8px;color:var(--text)}
+.md-content h3{font-size:16px;font-weight:600;margin:16px 0 6px}
+.md-content p{margin:8px 0}
+.md-content ul{margin:8px 0;padding-left:24px}
+.md-content li{margin:4px 0}
+.md-content code{font-family:var(--mono);font-size:13px;background:rgba(0,0,0,.05);padding:1px 5px;border-radius:4px}
+.md-content pre{background:rgba(0,0,0,.04);border-radius:8px;padding:14px;margin:12px 0;overflow-x:auto}
+.md-content pre code{background:none;padding:0;font-size:13px}
+.md-content strong{font-weight:600}
+
+/* editor */
+.editor-area{
+  width:100%;min-height:300px;padding:14px;
+  font-family:var(--mono);font-size:14px;line-height:1.6;
+  border:1px solid var(--border);border-radius:var(--radius);
+  background:var(--card);resize:vertical;color:var(--text);
+}
+.editor-area:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
+
+/* confirm bar */
+.confirm-bar{
+  background:rgba(255,59,48,.08);border:1px solid rgba(255,59,48,.2);
+  border-radius:var(--radius);padding:12px 16px;margin-bottom:16px;
+  display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;
+}
+.confirm-bar span{font-size:14px;font-weight:500;color:var(--red)}
+
+/* login */
+.login-wrap{display:flex;align-items:center;justify-content:center;min-height:80dvh}
+.login-card{
+  background:var(--card);border-radius:var(--radius);box-shadow:0 4px 24px rgba(0,0,0,.1);
+  padding:40px;width:100%;max-width:360px;text-align:center;
+}
+.login-card h2{font-size:22px;font-weight:600;margin-bottom:6px}
+.login-card p{font-size:13px;color:var(--text2);margin-bottom:24px}
+.login-card input{
+  width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:8px;
+  font:inherit;font-size:15px;margin-bottom:16px;
+}
+.login-card input:focus{outline:2px solid var(--accent);outline-offset:-1px;border-color:transparent}
+.login-card .error{color:var(--red);font-size:13px;margin-bottom:12px;display:none}
+
+/* empty state */
+.empty{text-align:center;padding:48px 20px;color:var(--text2);font-size:14px}
+
+/* folder icon */
+.folder-icon{color:var(--accent);margin-right:8px;font-size:18px}
+.file-icon{color:var(--text2);margin-right:8px;font-size:14px}
+
+/* loading */
+.loading{text-align:center;padding:40px;color:var(--text2);font-size:14px}
+
+@media(max-width:600px){
+  .container{padding:16px 12px}
+  .md-content{padding:16px}
+  .login-card{padding:28px 20px}
+}
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script>
+(function(){
+const $ = s => document.querySelector(s);
+const app = $('#app');
+let TOKEN = localStorage.getItem('tr_token') || '';
+let SERVER_MACHINE = '';
+
+// --- API helpers ---
+async function api(method, path, body) {
+  const opts = {method, headers: {}};
+  if (TOKEN) opts.headers['Authorization'] = 'Bearer ' + TOKEN;
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(path, opts);
+  if (r.status === 401) { logout(); throw new Error('Unauthorized'); }
+  const data = await r.json();
+  if (r.status >= 400) throw new Error(data.message || 'Request failed');
+  return data;
+}
+
+function logout() {
+  TOKEN = '';
+  localStorage.removeItem('tr_token');
+  route();
+}
+
+// --- Markdown renderer ---
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function inlineMd(t) {
+  return esc(t)
+    .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
+    .replace(/`(.+?)`/g, '<code>$1</code>')
+    .replace(/\\[(.+?)\\]\\((.+?)\\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+function renderMd(md) {
+  const lines = md.split('\\n');
+  let html = '', inCode = false, inList = false;
+  for (const line of lines) {
+    if (line.startsWith('```')) {
+      if (inList) { html += '</ul>'; inList = false; }
+      if (inCode) { html += '</code></pre>'; inCode = false; }
+      else { html += '<pre><code>'; inCode = true; }
+      continue;
+    }
+    if (inCode) { html += esc(line) + '\\n'; continue; }
+    if (line.startsWith('### ')) {
+      if (inList) { html += '</ul>'; inList = false; }
+      html += '<h3>' + inlineMd(line.slice(4)) + '</h3>';
+    } else if (line.startsWith('## ')) {
+      if (inList) { html += '</ul>'; inList = false; }
+      html += '<h2>' + inlineMd(line.slice(3)) + '</h2>';
+    } else if (line.startsWith('# ')) {
+      if (inList) { html += '</ul>'; inList = false; }
+      html += '<h1>' + inlineMd(line.slice(2)) + '</h1>';
+    } else if (/^- /.test(line)) {
+      if (!inList) { html += '<ul>'; inList = true; }
+      html += '<li>' + inlineMd(line.slice(2)) + '</li>';
+    } else if (line.trim() === '') {
+      if (inList) { html += '</ul>'; inList = false; }
+    } else {
+      if (inList) { html += '</ul>'; inList = false; }
+      html += '<p>' + inlineMd(line) + '</p>';
+    }
+  }
+  if (inList) html += '</ul>';
+  if (inCode) html += '</code></pre>';
+  return html;
+}
+
+function extractMeta(md) {
+  const meta = {};
+  for (const line of md.split('\\n')) {
+    const m = line.match(/^\\*\\*(.+?):\\*\\*\\s*(.+)$/);
+    if (m) meta[m[1].toLowerCase()] = m[2].trim().replace(/^`|`$/g, '');
+  }
+  return meta;
+}
+
+function extractTitle(md) {
+  for (const line of md.split('\\n')) {
+    if (line.startsWith('# ')) return line.slice(2).replace(/^Session:\\s*/i, '').trim();
+  }
+  return '';
+}
+
+function relativeTime(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const now = new Date();
+  const diff = Math.floor((now - d) / 1000);
+  if (diff < 60) return 'just now';
+  if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+  if (diff < 2592000) return Math.floor(diff/86400) + 'd ago';
+  return d.toLocaleDateString();
+}
+
+// --- Topbar ---
+function topbar() {
+  return `<div class="topbar">
+    <h1><a href="#/" style="color:inherit;text-decoration:none">Total Recall</a></h1>
+    <div class="right">
+      ${SERVER_MACHINE ? '<span class="machine">' + esc(SERVER_MACHINE) + '</span>' : ''}
+      <button onclick="window._logout()">Sign out</button>
+    </div>
+  </div>`;
+}
+window._logout = logout;
+
+// --- Router ---
+async function route() {
+  if (!TOKEN) { renderLogin(); return; }
+  const hash = location.hash || '#/';
+  const parts = hash.slice(2).split('/').map(decodeURIComponent);
+
+  if (!SERVER_MACHINE) {
+    try {
+      const st = await api('GET', '/api/v1/status');
+      SERVER_MACHINE = st.machine_id || '';
+    } catch(e) {}
+  }
+
+  try {
+    if (parts[0] === '' || parts.length === 0) {
+      await renderProjects();
+    } else if (parts[0] === 'project' && parts.length === 2) {
+      await renderFolders(parts[1]);
+    } else if (parts[0] === 'project' && parts.length >= 3 && parts[2] !== 'file') {
+      await renderFiles(parts[1], parts.slice(2).join('/'));
+    } else if (parts[0] === 'project' && parts.length >= 4 && parts[2] === 'file') {
+      await renderFile(parts[1], parts.slice(3).join('/'));
+    } else {
+      await renderProjects();
+    }
+  } catch(e) {
+    app.innerHTML = topbar() + '<div class="container"><div class="empty">Error: ' + esc(e.message) + '</div></div>';
+  }
+}
+
+// --- Login ---
+function renderLogin() {
+  app.innerHTML = `<div class="login-wrap"><div class="login-card">
+    <h2>Total Recall</h2>
+    <p>Enter your API token to continue</p>
+    <div class="error" id="login-error"></div>
+    <input type="password" id="login-token" placeholder="tr_sk_..." autofocus>
+    <button class="btn btn-primary" style="width:100%" onclick="window._doLogin()">Sign In</button>
+  </div></div>`;
+  $('#login-token').addEventListener('keydown', e => { if (e.key === 'Enter') window._doLogin(); });
+}
+window._doLogin = async function() {
+  const input = $('#login-token');
+  const err = $('#login-error');
+  const tok = input.value.trim();
+  if (!tok) return;
+  TOKEN = tok;
+  try {
+    await api('GET', '/api/v1/projects');
+    localStorage.setItem('tr_token', tok);
+    route();
+  } catch(e) {
+    TOKEN = '';
+    err.textContent = 'Invalid token';
+    err.style.display = 'block';
+  }
+};
+
+// --- Project list ---
+async function renderProjects() {
+  app.innerHTML = topbar() + '<div class="container"><div class="loading">Loading...</div></div>';
+  const data = await api('GET', '/api/v1/projects');
+  const projects = data.projects || [];
+  let html = topbar() + '<div class="container">';
+  html += '<div class="breadcrumb"><span>Projects</span></div>';
+  if (!projects.length) {
+    html += '<div class="empty">No projects found</div>';
+  } else {
+    for (const p of projects) {
+      html += `<div class="card" onclick="location.hash='#/project/${encodeURIComponent(p.name)}'">
+        <h3>${esc(p.name)}</h3>
+        <div class="meta">
+          <span>${p.file_count} file${p.file_count !== 1 ? 's' : ''}</span>
+          <span>${relativeTime(p.last_modified)}</span>
+        </div>
+      </div>`;
+    }
+  }
+  html += '</div>';
+  app.innerHTML = html;
+}
+
+// --- Folder list ---
+async function renderFolders(project) {
+  app.innerHTML = topbar() + '<div class="container"><div class="loading">Loading...</div></div>';
+  const data = await api('GET', '/api/v1/projects/' + encodeURIComponent(project) + '/tree');
+  const entries = data.entries || [];
+
+  // Group: top-level dirs and root files
+  const dirs = {};
+  const rootFiles = [];
+  for (const e of entries) {
+    const parts = e.path.split('/');
+    if (e.type === 'dir' && parts.length === 1) {
+      dirs[e.name] = {name: e.name, count: 0};
+    }
+    if (e.type === 'file' && !e.path.includes('/')) {
+      rootFiles.push(e);
+    }
+  }
+  // Count files per top-level dir
+  for (const e of entries) {
+    if (e.type !== 'file') continue;
+    const top = e.path.split('/')[0];
+    if (dirs[top]) dirs[top].count++;
+  }
+
+  let html = topbar() + '<div class="container">';
+  html += `<div class="breadcrumb"><a href="#/">Projects</a><span>/</span><span>${esc(project)}</span></div>`;
+
+  // Root files (MEMORY.md etc) pinned at top
+  for (const f of rootFiles) {
+    html += `<div class="card" onclick="location.hash='#/project/${encodeURIComponent(project)}/file/${encodeURIComponent(f.path)}'">
+      <h3><span class="file-icon">&#128196;</span>${esc(f.name)}</h3>
+      <div class="meta"><span>${relativeTime(f.mtime)}</span></div>
+    </div>`;
+  }
+
+  // Folders
+  const order = ['sessions','decisions','patterns','bugs'];
+  const sorted = Object.values(dirs).sort((a,b) => {
+    const ai = order.indexOf(a.name), bi = order.indexOf(b.name);
+    if (ai >= 0 && bi >= 0) return ai - bi;
+    if (ai >= 0) return -1;
+    if (bi >= 0) return 1;
+    return a.name.localeCompare(b.name);
+  });
+  for (const d of sorted) {
+    html += `<div class="card" onclick="location.hash='#/project/${encodeURIComponent(project)}/${encodeURIComponent(d.name)}'">
+      <h3><span class="folder-icon">&#128193;</span>${esc(d.name)}</h3>
+      <div class="meta"><span>${d.count} file${d.count !== 1 ? 's' : ''}</span></div>
+    </div>`;
+  }
+
+  if (!sorted.length && !rootFiles.length) {
+    html += '<div class="empty">Empty project</div>';
+  }
+  html += '</div>';
+  app.innerHTML = html;
+}
+
+// --- File list ---
+async function renderFiles(project, folder) {
+  app.innerHTML = topbar() + '<div class="container"><div class="loading">Loading...</div></div>';
+  const data = await api('GET', '/api/v1/projects/' + encodeURIComponent(project) + '/tree');
+  const entries = data.entries || [];
+
+  // Files in this folder (including nested)
+  const files = entries.filter(e => e.type === 'file' && e.path.startsWith(folder + '/'));
+  // Sub-dirs directly under this folder
+  const subDirs = entries.filter(e => {
+    if (e.type !== 'dir') return false;
+    if (!e.path.startsWith(folder + '/')) return false;
+    const rest = e.path.slice(folder.length + 1);
+    return !rest.includes('/');
+  });
+
+  // Sort files newest first by mtime
+  files.sort((a,b) => (b.mtime || '').localeCompare(a.mtime || ''));
+
+  let html = topbar() + '<div class="container">';
+  html += `<div class="breadcrumb">
+    <a href="#/">Projects</a><span>/</span>
+    <a href="#/project/${encodeURIComponent(project)}">${esc(project)}</a><span>/</span>
+    <span>${esc(folder)}</span>
+  </div>`;
+
+  // Sub-directories first
+  for (const d of subDirs) {
+    const dirFileCount = entries.filter(e => e.type === 'file' && e.path.startsWith(d.path + '/')).length;
+    html += `<div class="card" onclick="location.hash='#/project/${encodeURIComponent(project)}/${encodeURIComponent(d.path)}'">
+      <h3><span class="folder-icon">&#128193;</span>${esc(d.name)}</h3>
+      <div class="meta"><span>${dirFileCount} file${dirFileCount !== 1 ? 's' : ''}</span></div>
+    </div>`;
+  }
+
+  // Files directly in this folder
+  const directFiles = files.filter(f => {
+    const rest = f.path.slice(folder.length + 1);
+    return !rest.includes('/');
+  });
+
+  for (const f of directFiles) {
+    html += `<div class="card" onclick="location.hash='#/project/${encodeURIComponent(project)}/file/${encodeURIComponent(f.path)}'">
+      <h3>${esc(f.name.replace(/\\.md$/, ''))}</h3>
+      <div class="meta">
+        <span>${relativeTime(f.mtime)}</span>
+        <span>${(f.size / 1024).toFixed(1)} KB</span>
+      </div>
+    </div>`;
+  }
+
+  if (!directFiles.length && !subDirs.length) {
+    html += '<div class="empty">No files in this folder</div>';
+  }
+  html += '</div>';
+  app.innerHTML = html;
+}
+
+// --- File view ---
+async function renderFile(project, filePath) {
+  app.innerHTML = topbar() + '<div class="container"><div class="loading">Loading...</div></div>';
+  const data = await api('GET', '/api/v1/projects/' + encodeURIComponent(project) + '/file?path=' + encodeURIComponent(filePath));
+  const content = data.content || '';
+  const meta = data.metadata || {};
+  const parts = filePath.split('/');
+  const fileName = parts[parts.length - 1];
+  const folder = parts.slice(0, -1).join('/');
+  const title = extractTitle(content) || fileName;
+
+  let html = topbar() + '<div class="container">';
+
+  // Breadcrumb
+  html += `<div class="breadcrumb">
+    <a href="#/">Projects</a><span>/</span>
+    <a href="#/project/${encodeURIComponent(project)}">${esc(project)}</a><span>/</span>`;
+  if (folder) {
+    html += `<a href="#/project/${encodeURIComponent(project)}/${encodeURIComponent(folder)}">${esc(folder)}</a><span>/</span>`;
+  }
+  html += `<span>${esc(fileName)}</span></div>`;
+
+  // Metadata pills
+  html += '<div class="meta-pills">';
+  if (meta.date) html += '<span class="pill">' + esc(meta.date) + '</span>';
+  if (meta.machine) html += '<span class="pill">' + esc(meta.machine) + '</span>';
+  if (meta.project) html += '<span class="pill">' + esc(meta.project) + '</span>';
+  if (meta.tool) html += '<span class="pill">' + esc(meta.tool) + '</span>';
+  html += '</div>';
+
+  // Toolbar
+  html += `<div class="toolbar">
+    <button class="btn btn-secondary btn-sm" onclick="window._editFile()">&#9998; Edit</button>
+    <button class="btn btn-danger btn-sm" onclick="window._confirmDelete()">&#128465; Delete</button>
+  </div>`;
+
+  // Delete confirm bar (hidden)
+  html += `<div class="confirm-bar" id="delete-bar" style="display:none">
+    <span>Delete this memory permanently?</span>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-danger btn-sm" onclick="window._doDelete()">Yes, delete</button>
+      <button class="btn btn-secondary btn-sm" onclick="document.getElementById('delete-bar').style.display='none'">Cancel</button>
+    </div>
+  </div>`;
+
+  // Content
+  html += '<div class="md-content" id="file-content">' + renderMd(content) + '</div>';
+
+  // Editor (hidden)
+  html += `<div id="editor-wrap" style="display:none">
+    <textarea class="editor-area" id="editor-area"></textarea>
+    <div class="toolbar" style="margin-top:12px">
+      <button class="btn btn-primary btn-sm" onclick="window._saveFile()">Save</button>
+      <button class="btn btn-secondary btn-sm" onclick="window._cancelEdit()">Cancel</button>
+    </div>
+  </div>`;
+
+  html += '</div>';
+  app.innerHTML = html;
+
+  // Stash for edit/delete
+  window._fileState = {project, filePath, content, folder};
+}
+
+window._editFile = function() {
+  const s = window._fileState;
+  const area = $('#editor-area');
+  area.value = s.content;
+  area.rows = Math.max(15, s.content.split('\\n').length + 3);
+  $('#file-content').style.display = 'none';
+  $('#editor-wrap').style.display = 'block';
+  $('.toolbar').style.display = 'none';
+  area.focus();
+};
+
+window._cancelEdit = function() {
+  $('#file-content').style.display = 'block';
+  $('#editor-wrap').style.display = 'none';
+  $('.toolbar').style.display = 'flex';
+};
+
+window._saveFile = async function() {
+  const s = window._fileState;
+  const content = $('#editor-area').value;
+  try {
+    await api('PUT', '/api/v1/projects/' + encodeURIComponent(s.project) + '/file?path=' + encodeURIComponent(s.filePath), {content});
+    s.content = content;
+    $('#file-content').innerHTML = renderMd(content);
+    window._cancelEdit();
+  } catch(e) {
+    alert('Save failed: ' + e.message);
+  }
+};
+
+window._confirmDelete = function() {
+  $('#delete-bar').style.display = 'flex';
+};
+
+window._doDelete = async function() {
+  const s = window._fileState;
+  try {
+    await api('DELETE', '/api/v1/projects/' + encodeURIComponent(s.project) + '/file?path=' + encodeURIComponent(s.filePath), {confirm: true});
+    // Navigate back to folder
+    if (s.folder) {
+      location.hash = '#/project/' + encodeURIComponent(s.project) + '/' + encodeURIComponent(s.folder);
+    } else {
+      location.hash = '#/project/' + encodeURIComponent(s.project);
+    }
+  } catch(e) {
+    alert('Delete failed: ' + e.message);
+  }
+};
+
+// --- Init ---
+window.addEventListener('hashchange', route);
+route();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+# ---------------------------------------------------------------------------
+# Request handler
+# ---------------------------------------------------------------------------
+
+class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write(f"[{self.log_date_time_string()}] {fmt % args}\n")
+
+    # -- auth ---------------------------------------------------------------
+
+    def check_auth(self) -> bool:
+        keys = self.server.config.get("api_keys", [])
+        if not keys:
+            return True
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return False
+        return auth[7:] in keys
+
+    # -- response helpers ---------------------------------------------------
+
+    def send_json(self, data: dict, status: int = 200):
+        body = json.dumps(data, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def send_error_json(self, status: int, message: str):
+        self.send_json({"status": "error", "message": message}, status)
+
+    def send_html(self, html: str, status: int = 200):
+        body = html.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def read_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", 0))
+        if length == 0:
+            return {}
+        if length > MAX_BODY_SIZE:
+            return {}
+        raw = self.rfile.read(length)
+        return json.loads(raw.decode("utf-8"))
+
+    def _parse_path(self):
+        """Parse self.path into (path, query_dict)."""
+        parsed = urlparse(self.path)
+        return parsed.path, parse_qs(parsed.query)
+
+    def _match_project_route(self, path: str, suffix: str):
+        """Match /api/v1/projects/<name>/<suffix> and return project name."""
+        m = re.match(r"^/api/v1/projects/([^/]+)/" + re.escape(suffix) + r"$", path)
+        return unquote(m.group(1)) if m else None
+
+    # -- routing ------------------------------------------------------------
+
+    def do_GET(self):
+        path, query = self._parse_path()
+
+        # Unauthenticated routes
+        if path in ("/", ""):
+            self.serve_ui()
+            return
+        if path == "/favicon.ico":
+            self.serve_favicon()
+            return
+        if path == "/api/v1/status":
+            self.handle_status()
+            return
+
+        # Authenticated routes
+        if not self.check_auth():
+            self.send_error_json(401, "Unauthorized")
+            return
+
+        if path == "/api/v1/projects":
+            self.handle_list_projects()
+        elif (project := self._match_project_route(path, "tree")):
+            self.handle_project_tree(project)
+        elif (project := self._match_project_route(path, "file")):
+            self.handle_get_file(project, query)
+        else:
+            self.send_error_json(404, "Not found")
+
+    def do_POST(self):
+        if not self.check_auth():
+            self.send_error_json(401, "Unauthorized")
+            return
+        path, _ = self._parse_path()
+        if path == "/api/v1/write":
+            self.handle_write()
+        elif path == "/api/v1/query":
+            self.handle_query()
+        elif path == "/api/v1/ingest-upload":
+            self.handle_ingest_upload()
+        else:
+            self.send_error_json(404, "Not found")
+
+    def do_PUT(self):
+        if not self.check_auth():
+            self.send_error_json(401, "Unauthorized")
+            return
+        path, query = self._parse_path()
+        if (project := self._match_project_route(path, "file")):
+            self.handle_update_file(project, query)
+        else:
+            self.send_error_json(404, "Not found")
+
+    def do_DELETE(self):
+        if not self.check_auth():
+            self.send_error_json(401, "Unauthorized")
+            return
+        path, query = self._parse_path()
+        if (project := self._match_project_route(path, "file")):
+            self.handle_delete_file(project, query)
+        else:
+            self.send_error_json(404, "Not found")
+
+    # -- GET / --------------------------------------------------------------
+
+    def serve_ui(self):
+        self.send_html(WEB_UI_HTML)
+
+    def serve_favicon(self):
+        svg = (
+            '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">'
+            '<text y=".9em" font-size="90">🧠</text></svg>'
+        )
+        body = svg.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "image/svg+xml")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        self.wfile.write(body)
+
+    # -- GET /api/v1/status -------------------------------------------------
+
+    def handle_status(self):
+        shared_root = self.server.config["shared_root"]
+        projects = []
+        if os.path.isdir(shared_root):
+            projects = sorted(
+                d for d in os.listdir(shared_root)
+                if is_project_dir(shared_root, d)
+            )
+        rc, stdout, _ = run_qmd("status")
+        self.send_json({
+            "status": "ok",
+            "server": "total-recall",
+            "machine_id": machine_id(),
+            "projects": projects,
+            "qmd_status": stdout.strip() if rc == 0 else "qmd unavailable",
+        })
+
+    # -- GET /api/v1/projects -----------------------------------------------
+
+    def handle_list_projects(self):
+        shared_root = self.server.config["shared_root"]
+        projects = []
+        if os.path.isdir(shared_root):
+            for d in sorted(os.listdir(shared_root)):
+                if not is_project_dir(shared_root, d):
+                    continue
+                dpath = os.path.join(shared_root, d)
+                file_count = 0
+                latest_mtime = 0
+                for root, _, files in os.walk(dpath, followlinks=True):
+                    for f in files:
+                        if f.endswith(".md"):
+                            file_count += 1
+                            try:
+                                mt = os.path.getmtime(os.path.join(root, f))
+                                if mt > latest_mtime:
+                                    latest_mtime = mt
+                            except OSError:
+                                pass
+                projects.append({
+                    "name": d,
+                    "file_count": file_count,
+                    "last_modified": (
+                        datetime.fromtimestamp(latest_mtime, tz=timezone.utc).isoformat()
+                        if latest_mtime else None
+                    ),
+                })
+        self.send_json({"status": "ok", "projects": projects})
+
+    # -- GET /api/v1/projects/<name>/tree -----------------------------------
+
+    def handle_project_tree(self, project: str):
+        shared_root = self.server.config["shared_root"]
+        project_dir = os.path.join(shared_root, project)
+        if not os.path.isdir(project_dir):
+            self.send_error_json(404, "Project not found")
+            return
+
+        entries = []
+        for root, dirs, files in os.walk(project_dir, followlinks=True):
+            rel_root = os.path.relpath(root, project_dir)
+            if rel_root == ".":
+                rel_root = ""
+            dirs[:] = [d for d in sorted(dirs) if not d.startswith(".")]
+            for d in dirs:
+                entries.append({
+                    "type": "dir",
+                    "path": os.path.join(rel_root, d) if rel_root else d,
+                    "name": d,
+                })
+            for f in sorted(files):
+                if not f.endswith(".md"):
+                    continue
+                full = os.path.join(root, f)
+                try:
+                    st = os.stat(full)
+                except OSError:
+                    continue
+                entries.append({
+                    "type": "file",
+                    "path": os.path.join(rel_root, f) if rel_root else f,
+                    "name": f,
+                    "size": st.st_size,
+                    "mtime": datetime.fromtimestamp(
+                        st.st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                })
+        self.send_json({"status": "ok", "project": project, "entries": entries})
+
+    # -- GET /api/v1/projects/<name>/file?path=... --------------------------
+
+    def handle_get_file(self, project: str, query: dict):
+        rel_path = (query.get("path") or [""])[0]
+        safe = safe_rel_path(rel_path)
+        if safe is None:
+            self.send_error_json(400, "Missing or invalid 'path' parameter")
+            return
+
+        shared_root = self.server.config["shared_root"]
+        full_path = os.path.join(shared_root, project, safe)
+        if not os.path.isfile(full_path):
+            self.send_error_json(404, "File not found")
+            return
+
+        with open(full_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        # Parse metadata from **Key:** Value lines
+        meta = {}
+        for line in content.split("\n"):
+            m = re.match(r"^\*\*(.+?):\*\*\s*(.+)$", line)
+            if m:
+                meta[m.group(1).lower()] = m.group(2).strip()
+
+        st = os.stat(full_path)
+        self.send_json({
+            "status": "ok",
+            "path": rel_path,
+            "content": content,
+            "metadata": meta,
+            "size": st.st_size,
+            "mtime": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+        })
+
+    # -- PUT /api/v1/projects/<name>/file?path=... --------------------------
+
+    def handle_update_file(self, project: str, query: dict):
+        rel_path = (query.get("path") or [""])[0]
+        safe = safe_rel_path(rel_path)
+        if safe is None:
+            self.send_error_json(400, "Missing or invalid 'path' parameter")
+            return
+
+        try:
+            data = self.read_body()
+        except Exception:
+            self.send_error_json(400, "Invalid JSON")
+            return
+
+        content = data.get("content")
+        if content is None:
+            self.send_error_json(400, "Missing 'content'")
+            return
+
+        shared_root = self.server.config["shared_root"]
+        full_path = os.path.join(shared_root, project, safe)
+        if not os.path.isfile(full_path):
+            self.send_error_json(404, "File not found")
+            return
+
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        with self.server.qmd_lock:
+            run_qmd("update")
+            run_qmd("embed")
+
+        self.send_json({"status": "ok", "path": rel_path})
+
+    # -- DELETE /api/v1/projects/<name>/file?path=... -----------------------
+
+    def handle_delete_file(self, project: str, query: dict):
+        rel_path = (query.get("path") or [""])[0]
+        safe = safe_rel_path(rel_path)
+        if safe is None:
+            self.send_error_json(400, "Missing or invalid 'path' parameter")
+            return
+
+        try:
+            data = self.read_body()
+        except Exception:
+            self.send_error_json(400, "Invalid JSON")
+            return
+
+        if not data.get("confirm"):
+            self.send_error_json(400, "Deletion requires {\"confirm\": true}")
+            return
+
+        shared_root = self.server.config["shared_root"]
+        full_path = os.path.join(shared_root, project, safe)
+        if not os.path.isfile(full_path):
+            self.send_error_json(404, "File not found")
+            return
+
+        os.remove(full_path)
+
+        with self.server.qmd_lock:
+            run_qmd("update")
+
+        self.send_json({"status": "ok", "path": rel_path, "deleted": True})
+
+    # -- POST /api/v1/write -------------------------------------------------
+
+    def handle_write(self):
+        try:
+            data = self.read_body()
+        except Exception:
+            self.send_error_json(400, "Invalid JSON")
+            return
+
+        summary = (data.get("summary") or "").strip()
+        project = slugify(data.get("project") or "")
+        mid = data.get("machine_id") or "unknown"
+
+        if not summary:
+            self.send_error_json(400, "Missing 'summary'")
+            return
+        if not project:
+            self.send_error_json(400, "Missing 'project'")
+            return
+
+        shared_root = self.server.config["shared_root"]
+        project_dir = os.path.join(shared_root, project)
+        sessions_dir = os.path.join(project_dir, "sessions")
+        os.makedirs(sessions_dir, exist_ok=True)
+
+        date_str = date.today().isoformat()
+        topic = slugify(" ".join(summary.split()[:6]))
+        filename = os.path.join(sessions_dir, f"{date_str}-{topic}.md")
+        i = 2
+        while os.path.exists(filename):
+            filename = os.path.join(sessions_dir, f"{date_str}-{topic}-{i}.md")
+            i += 1
+
+        content = (
+            f"# Session: {summary}\n\n"
+            f"**Date:** {date_str}\n"
+            f"**Project:** {project}\n"
+            f"**Machine:** {mid}\n"
+            f"**Topic:** {topic}\n"
+            f"**Tool:** Claude Code / Codex\n\n"
+            f"## What Was Done\n"
+            f"- {summary}\n\n"
+            f"## Decisions Made\n"
+            f"- (auto-generated note)\n\n"
+            f"## Lessons Learned\n"
+            f"- Keep memory notes concise and include concrete file paths or commands when relevant.\n"
+        )
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(content)
+
+        collection = slugify(project)
+        with self.server.qmd_lock:
+            run_qmd("update")
+            run_qmd("embed")
+
+        self.send_json({
+            "status": "ok",
+            "file": filename,
+            "collection": collection,
+        })
+
+    # -- POST /api/v1/query -------------------------------------------------
+
+    def handle_query(self):
+        try:
+            data = self.read_body()
+        except Exception:
+            self.send_error_json(400, "Invalid JSON")
+            return
+
+        query = (data.get("query") or "").strip()
+        project = slugify(data.get("project") or "")
+
+        if not query:
+            self.send_error_json(400, "Missing 'query'")
+            return
+
+        collection = slugify(project) if project else ""
+
+        if collection:
+            rc_ls, _, _ = run_qmd("ls", collection)
+            if rc_ls == 0:
+                rc, stdout, _ = run_qmd("query", query, "-c", collection)
+            else:
+                rc, stdout, _ = run_qmd("query", query)
+        else:
+            rc, stdout, _ = run_qmd("query", query)
+
+        if rc == 0 and stdout.strip():
+            self.send_json({"status": "ok", "results": stdout.strip()})
+        else:
+            self.send_json({"status": "ok", "results": "No memory available."})
+
+    # -- POST /api/v1/ingest-upload -----------------------------------------
+
+    def handle_ingest_upload(self):
+        try:
+            data = self.read_body()
+        except Exception:
+            self.send_error_json(400, "Invalid JSON")
+            return
+
+        project = slugify(data.get("project") or "")
+        files = data.get("files") or []
+        mid = data.get("machine_id") or "unknown"
+
+        if not project:
+            self.send_error_json(400, "Missing 'project'")
+            return
+
+        shared_root = self.server.config["shared_root"]
+        project_dir = os.path.join(shared_root, project)
+
+        written = 0
+        skipped = 0
+        for entry in files:
+            rel_path = entry.get("relative_path", "")
+            content = entry.get("content", "")
+            if not rel_path or not content:
+                skipped += 1
+                continue
+
+            safe = safe_rel_path(rel_path)
+            if safe is None:
+                skipped += 1
+                continue
+
+            full_path = os.path.join(project_dir, safe)
+            if os.path.exists(full_path):
+                skipped += 1
+                continue
+
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            written += 1
+
+        if written > 0:
+            with self.server.qmd_lock:
+                run_qmd("update")
+                run_qmd("embed")
+
+        self.send_json({
+            "status": "ok",
+            "written": written,
+            "skipped": skipped,
+            "machine_id": mid,
+        })
+
+
+# ---------------------------------------------------------------------------
+# Server
+# ---------------------------------------------------------------------------
+
+class TotalRecallServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+    def __init__(self, config: dict, *args, **kwargs):
+        self.config = config
+        self.qmd_lock = threading.Lock()
+        super().__init__(*args, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(description="total-recall HTTP API server")
+    parser.add_argument(
+        "--config",
+        default=os.path.expanduser("~/.ai-memory/server.json"),
+        help="Path to server config JSON",
+    )
+    args = parser.parse_args()
+
+    config = load_config(args.config)
+    bind = config.get("bind_address", "0.0.0.0")
+    port = config.get("port", DEFAULT_PORT)
+
+    server = TotalRecallServer(config, (bind, port), TotalRecallHandler)
+
+    def shutdown_handler(signum, frame):
+        print("\nShutting down server...")
+        threading.Thread(target=server.shutdown).start()
+
+    signal.signal(signal.SIGTERM, shutdown_handler)
+    signal.signal(signal.SIGINT, shutdown_handler)
+
+    print(f"total-recall server listening on {bind}:{port}")
+    print(f"Machine: {machine_id()}")
+    print(f"Shared root: {config['shared_root']}")
+    print(f"API keys configured: {len(config.get('api_keys', []))}")
+    print(f"Web UI: http://localhost:{port}/")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

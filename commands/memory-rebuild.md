@@ -68,6 +68,7 @@ For each identified session, write to `<knowledge-dir>/sessions/YYYY-MM-DD-<topi
 # Session: [Brief Title]
 
 **Date:** YYYY-MM-DD
+**Machine:** !`scutil --get ComputerName 2>/dev/null || hostname -s`
 **Topic:** [Category — specific area]
 **Tool:** [Claude Code / Codex CLI / Cursor / Manual]
 

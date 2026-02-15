@@ -5,10 +5,25 @@ import glob
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+
+def get_machine_id() -> str:
+    """Get a stable, human-readable machine identifier."""
+    try:
+        result = subprocess.check_output(
+            ["scutil", "--get", "ComputerName"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+        if result:
+            return result
+    except Exception:
+        pass
+    return socket.gethostname().split(".")[0] or "unknown"
 
 
 def slugify(value: str) -> str:
@@ -163,7 +178,7 @@ def extract_codex_session(session_path: Path):
     return {"session_id": session_id, "date": first_date, "cwd": cwd, "messages": messages}
 
 
-def write_codex_markdown(output_dir: Path, source_file: Path, session_info: dict) -> bool:
+def write_codex_markdown(output_dir: Path, source_file: Path, session_info: dict, project_name: str) -> bool:
     session_id = slugify(session_info["session_id"])
     date = session_info["date"]
     out_path = output_dir / f"{date}-codex-{session_id}.md"
@@ -175,9 +190,8 @@ def write_codex_markdown(output_dir: Path, source_file: Path, session_info: dict
     lines.append(f"# Imported Session: Codex {session_info['session_id']}")
     lines.append("")
     lines.append(f"**Date:** {date}")
-    lines.append(f"**Source:** `{source_file}`")
-    if session_info["cwd"]:
-        lines.append(f"**CWD:** `{session_info['cwd']}`")
+    lines.append(f"**Project:** {project_name}")
+    lines.append(f"**Machine:** {get_machine_id()}")
     lines.append(f"**Imported At:** {now_utc_iso()}")
     lines.append("")
     lines.append("## User Messages")
@@ -224,7 +238,7 @@ def ingest_codex(args, state, resolver, imported_dir: Path):
             processed[abs_path] = mtime
             continue
 
-        if write_codex_markdown(imported_dir / "codex", Path(abs_path), info):
+        if write_codex_markdown(imported_dir / "codex", Path(abs_path), info, args.project):
             wrote += 1
         processed[abs_path] = mtime
 
@@ -293,7 +307,8 @@ def ingest_claude(args, state, resolver, imported_dir: Path):
             if is_new:
                 out.write(f"# Imported Session: Claude {session_id}\n\n")
                 out.write(f"**Date:** {date}\n")
-                out.write(f"**Project Path:** `{items[0][3]}`\n")
+                out.write(f"**Project:** {args.project}\n")
+                out.write(f"**Machine:** {get_machine_id()}\n")
                 out.write(f"**Imported At:** {now_utc_iso()}\n\n")
                 out.write("## User Messages\n")
 

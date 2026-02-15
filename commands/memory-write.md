@@ -36,6 +36,7 @@ Write the summary to `<knowledge-dir>/sessions/YYYY-MM-DD-<topic>.md` using this
 # Session: [Brief Title]
 
 **Date:** YYYY-MM-DD
+**Machine:** !`scutil --get ComputerName 2>/dev/null || hostname -s`
 **Topic:** [Category — specific area]
 
 ## What Was Done

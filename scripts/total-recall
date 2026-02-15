@@ -27,6 +27,8 @@ Usage:
   total-recall icloud-enable [--project NAME] [--shared-root PATH] [--icloud-root PATH] [--skip-embed]
   total-recall icloud-sync [--project NAME] [--shared-root PATH] [--icloud-root PATH] [--direction push|pull|both]
   total-recall icloud-status [--project NAME] [--shared-root PATH] [--icloud-root PATH]
+  total-recall server {init|start|stop|status|add-key|install-launchd}
+  total-recall client {configure --server-url URL --api-key KEY|status|disable|enable}
 
 Notes:
   - setup links both ~/.claude/knowledge/<project> and ~/.codex/knowledge/<project>
@@ -37,6 +39,10 @@ Notes:
   - icloud-sync is a manual backup/restore sync helper.
   - write creates a markdown session note and re-indexes qmd.
   - query runs qmd hybrid search scoped to the project collection when possible.
+  - server runs the total-recall HTTP API for multi-machine memory sharing.
+  - client configures this machine to use a remote total-recall server.
+  When client is configured, write/query/ingest route to the server automatically.
+  Set TOTAL_RECALL_SERVER_URL and TOTAL_RECALL_API_KEY env vars to override config.
 EOF
 }
 
@@ -82,6 +88,57 @@ slugify() {
     out="memory"
   fi
   printf '%s' "$out"
+}
+
+machine_id() {
+  local name
+  name="$(scutil --get ComputerName 2>/dev/null)" && [[ -n "$name" ]] && { printf '%s' "$name"; return; }
+  name="$(hostname -s 2>/dev/null)" && [[ -n "$name" ]] && { printf '%s' "$name"; return; }
+  hostname 2>/dev/null || echo "unknown"
+}
+
+is_remote_configured() {
+  [[ -n "${TOTAL_RECALL_SERVER_URL:-}" ]] && return 0
+  local config="$HOME/.ai-memory/client.json"
+  [[ -f "$config" ]] || return 1
+  local url
+  url="$(python3 -c "import json; print(json.load(open('$config')).get('server_url',''))" 2>/dev/null)"
+  [[ -n "$url" ]] && return 0
+  return 1
+}
+
+get_remote_url() {
+  if [[ -n "${TOTAL_RECALL_SERVER_URL:-}" ]]; then
+    printf '%s' "$TOTAL_RECALL_SERVER_URL"
+    return
+  fi
+  python3 -c "import json; print(json.load(open('$HOME/.ai-memory/client.json')).get('server_url',''))" 2>/dev/null
+}
+
+get_api_key() {
+  if [[ -n "${TOTAL_RECALL_API_KEY:-}" ]]; then
+    printf '%s' "$TOTAL_RECALL_API_KEY"
+    return
+  fi
+  python3 -c "import json; print(json.load(open('$HOME/.ai-memory/client.json')).get('api_key',''))" 2>/dev/null
+}
+
+get_machine_id_from_config() {
+  python3 -c "import json; print(json.load(open('$HOME/.ai-memory/client.json')).get('machine_id',''))" 2>/dev/null
+}
+
+remote_post() {
+  local endpoint="$1"
+  local body="$2"
+  local url api_key
+  url="$(get_remote_url)"
+  api_key="$(get_api_key)"
+  curl -sf --max-time 15 \
+    -X POST \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer $api_key" \
+    -d "$body" \
+    "${url}${endpoint}"
 }
 
 derive_project_name() {
@@ -434,9 +491,10 @@ write_memory_note() {
   local sessions_dir="$shared_project_dir/sessions"
   safe_mkdir "$sessions_dir"
 
-  local date_str topic filename i
+  local date_str topic filename i mid
   date_str="$(date +%Y-%m-%d)"
   topic="$(slugify "$(printf '%s' "$summary" | cut -d' ' -f1-6)")"
+  mid="$(machine_id)"
   filename="$sessions_dir/$date_str-$topic.md"
   i=2
   while [[ -e "$filename" ]]; do
@@ -448,6 +506,8 @@ write_memory_note() {
 # Session: ${summary}
 
 **Date:** ${date_str}
+**Project:** ${project_name}
+**Machine:** ${mid}
 **Topic:** ${topic}
 **Tool:** Claude Code / Codex
 
@@ -455,7 +515,7 @@ write_memory_note() {
 - ${summary}
 
 ## Decisions Made
-- Shared memory stored under \`${shared_project_dir}\`.
+- (auto-generated note)
 
 ## Lessons Learned
 - Keep memory notes concise and include concrete file paths or commands when relevant.
@@ -594,6 +654,20 @@ cmd_write() {
   project_name="$(derive_project_name "$project_arg")"
   shared_root="$(abs_realpath "$shared_root")"
   summary="$*"
+
+  # Remote mode: POST to server
+  if is_remote_configured; then
+    local mid body response
+    mid="$(get_machine_id_from_config)"
+    [[ -n "$mid" ]] || mid="$(machine_id)"
+    body="$(python3 -c "import json,sys; print(json.dumps({'summary':sys.argv[1],'project':sys.argv[2],'machine_id':sys.argv[3]}))" "$summary" "$project_name" "$mid")"
+    if response="$(remote_post "/api/v1/write" "$body" 2>/dev/null)"; then
+      echo "Memory written to server: $(echo "$response" | python3 -c "import json,sys; print(json.load(sys.stdin).get('file','ok'))" 2>/dev/null || echo "ok")"
+      return 0
+    fi
+    echo "Warning: Server unreachable; falling back to local write." >&2
+  fi
+
   write_memory_note "$project_name" "$shared_root" "$summary" || {
     echo "Could not write memory (filesystem may be read-only). Summary not persisted."
     return 0
@@ -621,6 +695,18 @@ cmd_query() {
   done
 
   [[ -n "$query" ]] || die "query requires a search string"
+
+  # Remote mode: POST to server
+  if is_remote_configured; then
+    local project_name body response
+    project_name="$(derive_project_name "$project_arg")"
+    body="$(python3 -c "import json,sys; print(json.dumps({'query':sys.argv[1],'project':sys.argv[2]}))" "$query" "$project_name")"
+    if response="$(remote_post "/api/v1/query" "$body" 2>/dev/null)"; then
+      python3 -c "import json,sys; print(json.load(sys.stdin).get('results','No results.'))" <<<"$response"
+      return 0
+    fi
+    echo "Warning: Server unreachable; falling back to local query." >&2
+  fi
 
   if ! command -v qmd >/dev/null 2>&1; then
     echo "No memory available (qmd not installed). Continuing without prior context."
@@ -759,6 +845,45 @@ cmd_ingest() {
     qmd update
     if [[ "$skip_embed" != "1" ]]; then
       qmd embed || true
+    fi
+  fi
+
+  # Upload newly-imported sessions to remote server if configured
+  if is_remote_configured && (( total_written > 0 )); then
+    local imported_dir="$shared_project_dir/sessions/imported"
+    local mid
+    mid="$(get_machine_id_from_config)"
+    [[ -n "$mid" ]] || mid="$(machine_id)"
+
+    local files_json
+    files_json="$(python3 - "$imported_dir" <<'PY'
+import json, os, sys, time
+base = sys.argv[1]
+cutoff = time.time() - 300  # last 5 minutes
+files = []
+if os.path.isdir(base):
+    for root, dirs, names in os.walk(base):
+        for name in names:
+            if not name.endswith(".md"):
+                continue
+            full = os.path.join(root, name)
+            if os.path.getmtime(full) >= cutoff:
+                rel = os.path.relpath(full, os.path.dirname(base))
+                with open(full) as f:
+                    content = f.read()
+                files.append({"relative_path": rel, "content": content})
+print(json.dumps(files))
+PY
+)"
+
+    if [[ "$files_json" != "[]" ]]; then
+      local body
+      body="$(python3 -c "import json,sys; print(json.dumps({'project':sys.argv[1],'machine_id':sys.argv[2],'files':json.loads(sys.argv[3])}))" "$project_name" "$mid" "$files_json")"
+      if remote_post "/api/v1/ingest-upload" "$body" >/dev/null 2>&1; then
+        echo "Uploaded imported sessions to remote server."
+      else
+        echo "Warning: Could not upload to remote server." >&2
+      fi
     fi
   fi
 
@@ -1073,6 +1198,239 @@ cmd_icloud_status() {
   fi
 }
 
+cmd_server() {
+  local subcmd="${1:-}"
+  shift || true
+
+  local server_script
+  server_script="$(script_dir)/total-recall-server"
+  local config_path="$HOME/.ai-memory/server.json"
+  local pid_file="$HOME/.ai-memory/server.pid"
+  local log_dir="$HOME/.ai-memory/logs"
+
+  case "$subcmd" in
+    init)
+      safe_mkdir "$(dirname "$config_path")"
+      local api_key
+      api_key="$(python3 -c "import secrets; print('tr_sk_' + secrets.token_hex(24))")"
+      python3 - "$config_path" "$api_key" <<'PY'
+import json, sys
+path, key = sys.argv[1], sys.argv[2]
+config = {"port": 7899, "api_keys": [key], "shared_root": "~/.ai-memory/knowledge", "bind_address": "0.0.0.0"}
+with open(path, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+print(f"Server config written to {path}")
+print(f"API key: {key}")
+print(f"Share this key with clients for authentication.")
+PY
+      ;;
+
+    start)
+      [[ -f "$config_path" ]] || die "No server config. Run: total-recall server init"
+      [[ -f "$server_script" ]] || die "Server script not found: $server_script"
+      safe_mkdir "$log_dir"
+
+      if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+        echo "Server already running (PID $(cat "$pid_file"))"
+        return 0
+      fi
+
+      nohup python3 "$server_script" --config "$config_path" \
+        >"$log_dir/server.out.log" 2>"$log_dir/server.err.log" &
+      local pid=$!
+      echo "$pid" > "$pid_file"
+      sleep 1
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "Server started (PID $pid)"
+        local port
+        port="$(python3 -c "import json; print(json.load(open('$config_path')).get('port', 7899))")"
+        echo "Listening on port $port"
+      else
+        echo "Server failed to start. Check $log_dir/server.err.log"
+        rm -f "$pid_file"
+        return 1
+      fi
+      ;;
+
+    stop)
+      if [[ -f "$pid_file" ]]; then
+        local pid
+        pid="$(cat "$pid_file")"
+        if kill -0 "$pid" 2>/dev/null; then
+          kill "$pid"
+          echo "Server stopped (PID $pid)"
+        else
+          echo "Server not running (stale PID file)"
+        fi
+        rm -f "$pid_file"
+      else
+        echo "No PID file found. Server may not be running."
+      fi
+      ;;
+
+    status)
+      if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+        echo "Server running (PID $(cat "$pid_file"))"
+        if [[ -f "$config_path" ]]; then
+          local port
+          port="$(python3 -c "import json; print(json.load(open('$config_path')).get('port', 7899))")"
+          echo "Port: $port"
+          curl -sf "http://127.0.0.1:$port/api/v1/status" 2>/dev/null \
+            | python3 -m json.tool 2>/dev/null \
+            || echo "(could not reach status endpoint)"
+        fi
+      else
+        echo "Server not running."
+      fi
+      ;;
+
+    add-key)
+      [[ -f "$config_path" ]] || die "No server config. Run: total-recall server init"
+      python3 - "$config_path" <<'PY'
+import json, secrets, sys
+path = sys.argv[1]
+with open(path) as f:
+    config = json.load(f)
+key = "tr_sk_" + secrets.token_hex(24)
+config.setdefault("api_keys", []).append(key)
+with open(path, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+print(f"New API key: {key}")
+PY
+      ;;
+
+    install-launchd)
+      [[ -f "$config_path" ]] || die "No server config. Run: total-recall server init"
+      [[ -f "$server_script" ]] || die "Server script not found: $server_script"
+      local label="com.totalrecall.server"
+      local plist="$HOME/Library/LaunchAgents/$label.plist"
+      safe_mkdir "$log_dir"
+      safe_mkdir "$HOME/Library/LaunchAgents"
+
+      python3 - "$plist" "$server_script" "$config_path" "$log_dir" <<'PY'
+import plistlib, sys
+from pathlib import Path
+
+plist_path, server_script, config_path, log_dir = sys.argv[1:]
+cmd = (
+    'export PATH="$HOME/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"; '
+    f'exec python3 "{server_script}" --config "{config_path}"'
+)
+payload = {
+    "Label": "com.totalrecall.server",
+    "ProgramArguments": ["/bin/bash", "-lc", cmd],
+    "RunAtLoad": True,
+    "KeepAlive": True,
+    "StandardOutPath": f"{log_dir}/server.out.log",
+    "StandardErrorPath": f"{log_dir}/server.err.log",
+    "ProcessType": "Background",
+}
+Path(plist_path).parent.mkdir(parents=True, exist_ok=True)
+with open(plist_path, "wb") as f:
+    plistlib.dump(payload, f)
+print(f"LaunchAgent written to {plist_path}")
+PY
+
+      local uid
+      uid="$(id -u)"
+      launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+      if ! launchctl bootstrap "gui/$uid" "$plist" >/dev/null 2>&1; then
+        launchctl load -w "$plist" >/dev/null 2>&1 || true
+      fi
+      echo "Server LaunchAgent installed and started."
+      ;;
+
+    *)
+      echo "Usage: total-recall server {init|start|stop|status|add-key|install-launchd}"
+      ;;
+  esac
+}
+
+cmd_client() {
+  local subcmd="${1:-}"
+  shift || true
+
+  local config_path="$HOME/.ai-memory/client.json"
+
+  case "$subcmd" in
+    configure)
+      local server_url="" api_key=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --server-url) server_url="$2"; shift 2 ;;
+          --api-key) api_key="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+
+      [[ -n "$server_url" ]] || die "Usage: total-recall client configure --server-url URL --api-key KEY"
+      [[ -n "$api_key" ]] || die "Usage: total-recall client configure --server-url URL --api-key KEY"
+
+      local mid
+      mid="$(machine_id)"
+      safe_mkdir "$(dirname "$config_path")"
+      python3 - "$config_path" "$server_url" "$api_key" "$mid" <<'PY'
+import json, sys
+path, url, key, mid = sys.argv[1:]
+config = {"server_url": url.rstrip("/"), "api_key": key, "machine_id": mid}
+with open(path, "w") as f:
+    json.dump(config, f, indent=2)
+    f.write("\n")
+print(f"Client configured.")
+print(f"  Server: {url}")
+print(f"  Machine: {mid}")
+PY
+      ;;
+
+    status)
+      if [[ ! -f "$config_path" ]]; then
+        echo "No client config. Running in local mode."
+        echo "Machine: $(machine_id)"
+        return 0
+      fi
+      python3 - "$config_path" <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    config = json.load(f)
+print(f"Server URL: {config.get('server_url', 'not set')}")
+print(f"Machine ID: {config.get('machine_id', 'not set')}")
+print(f"API key:    {config.get('api_key', '')[:12]}...")
+PY
+      local url
+      url="$(get_remote_url)"
+      if curl -sf --max-time 3 "${url}/api/v1/status" >/dev/null 2>&1; then
+        echo "Server:     reachable"
+      else
+        echo "Server:     unreachable"
+      fi
+      ;;
+
+    disable)
+      if [[ -f "$config_path" ]]; then
+        mv "$config_path" "${config_path}.disabled"
+        echo "Client mode disabled. Using local mode."
+      else
+        echo "Already in local mode."
+      fi
+      ;;
+
+    enable)
+      if [[ -f "${config_path}.disabled" ]]; then
+        mv "${config_path}.disabled" "$config_path"
+        echo "Client mode re-enabled."
+      else
+        echo "No disabled config found. Run: total-recall client configure --server-url URL --api-key KEY"
+      fi
+      ;;
+
+    *)
+      echo "Usage: total-recall client {configure --server-url URL --api-key KEY|status|disable|enable}"
+      ;;
+  esac
+}
+
 main() {
   local cmd="${1:-}"
   if [[ -z "$cmd" ]]; then
@@ -1091,6 +1449,8 @@ main() {
     icloud-enable) cmd_icloud_enable "$@" ;;
     icloud-sync) cmd_icloud_sync "$@" ;;
     icloud-status) cmd_icloud_status "$@" ;;
+    server) cmd_server "$@" ;;
+    client) cmd_client "$@" ;;
     -h|--help|help) usage ;;
     *) die "Unknown command: $cmd" ;;
   esac
