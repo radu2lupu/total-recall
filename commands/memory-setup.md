@@ -17,6 +17,8 @@ Set up cross-session semantic memory for the current project. This runs the full
 - qmd installed: !`command -v qmd >/dev/null 2>&1 && echo "yes" || echo "no"`
 - bun installed: !`command -v bun >/dev/null 2>&1 && echo "yes" || echo "no"`
 - Plugin root: !`echo "${CLAUDE_PLUGIN_ROOT:-unknown}"`
+- Client configured: !`[ -f "$HOME/.ai-memory/client.json" ] && echo "yes" || echo "no"`
+- Server configured: !`[ -f "$HOME/.ai-memory/server.json" ] && echo "yes" || echo "no"`
 - User arguments: $ARGUMENTS
 
 ## Your Task
@@ -44,7 +46,10 @@ Ask the user these questions **before** running anything. Present them all at on
 
 **Background sync:** Only ask on macOS. Default yes. Explain: "This installs a background job that imports new Claude/Codex session logs every 15 minutes."
 
-If the platform is not macOS, skip the iCloud and background sync questions — use `--no-icloud --no-launch-agent`.
+**Multi-machine mode:** If no server or client is configured, ask if this machine should:
+- **Standalone** (default) — memory stays local (with optional iCloud)
+- **Server** — this machine hosts a total-recall HTTP server that other machines connect to
+- **Client** — this machine connects to an existing total-recall server
 
 ### 3. Run total-recall install
 
@@ -59,9 +64,31 @@ Build the command from the user's answers:
 
 Where `<plugin-root>` is the Plugin root from context above. Run it and let the output stream.
 
-### 4. Report results
+### 4. Multi-machine setup (if selected)
+
+**If Server:**
+```bash
+<plugin-root>/scripts/total-recall server init
+<plugin-root>/scripts/total-recall server start
+```
+Tell the user their API key and server URL. Ask if they want to auto-start on boot:
+```bash
+<plugin-root>/scripts/total-recall server install-launchd
+```
+
+**If Client:**
+Ask the user for the server URL and API key, then:
+```bash
+<plugin-root>/scripts/total-recall client configure \
+  --server-url <url> \
+  --api-key <key>
+```
+
+### 5. Report results
 
 Tell the user:
 - Setup is complete
 - Memory is fully automatic — Claude will query past memories at session start and save new ones at session end, no manual commands needed
+- If server mode: share the server URL and API key with other machines, and mention the web UI at `http://<server>:7899/`
+- If client mode: confirm the connection is active with `total-recall client status`
 - `/memory-rebuild` can optionally backfill memory from git history if they want to seed it with past work

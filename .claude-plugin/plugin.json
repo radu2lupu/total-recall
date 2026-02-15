@@ -1,6 +1,6 @@
 {
   "name": "total-recall",
-  "description": "Cross-session semantic memory for Claude Code. Provides knowledge persistence via BM25 + vector search using qmd.",
+  "description": "Persistent cross-session memory for Claude Code. Automatically stores decisions, patterns, and lessons learned in a semantic search index so every session starts with full context. Supports multi-machine sharing via HTTP server with web UI.",
   "author": {
     "name": "Radu Lupu"
   }

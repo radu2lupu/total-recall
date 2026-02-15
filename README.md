@@ -1,103 +1,147 @@
 # total-recall
 
-Install once, then Claude Code + Codex share one `qmd` memory, auto-import session logs, and keep it synced in the background (including iCloud).
+Persistent cross-session memory for Claude Code. Stores decisions, patterns, and lessons learned in a semantic search index (qmd) so every new session starts with full context of past work.
 
-## One Command Install
+Works on a single machine with iCloud backup, or across multiple machines via a built-in HTTP server with a web UI for browsing and editing memories.
 
-```bash
-./scripts/install.sh --project total-recall
-```
+## Quick Start
 
-What `install` does automatically:
-- Creates shared memory at `~/.ai-memory/knowledge/<project>`.
-- Links:
-  - `~/.claude/knowledge/<project>`
-  - `~/.codex/knowledge/<project>`
-- Enables `qmd` MCP in both:
-  - `~/.claude/settings.json`
-  - `~/.codex/config.toml`
-- Enables iCloud-backed memory (default) at:
-  - `~/Library/Mobile Documents/com~apple~CloudDocs/AI-Memory/knowledge/<project>`
-- Imports existing Codex and Claude session history into markdown memory files.
-- Re-indexes + embeds into `qmd`.
-- Injects auto-memory instructions into:
-  - `~/.claude/CLAUDE.md`
-  - `~/.codex/AGENTS.md`
-- Installs a macOS `launchd` background job that re-runs ingestion periodically.
-
-## Claude Plugin Usage
-
-In Claude Code:
+### Claude Code Plugin (recommended)
 
 ```text
-/plugin marketplace add radu2lupu/total-recall
-/plugin install total-recall@total-recall
+/install radu2lupu/total-recall
 ```
 
-The plugin commands are still available:
-- `/memory-setup`
-- `/memory-write`
-- `/memory-rebuild`
+Then run `/memory-setup` inside any project to configure it.
 
-## Core Commands
+### Manual Install
 
 ```bash
-./scripts/total-recall install --project my-project
-./scripts/total-recall ingest --project my-project
-./scripts/total-recall query --project my-project "retry strategy for upload queue"
-./scripts/total-recall write --project my-project "implemented deduplicated retry backoff"
-./scripts/total-recall status --project my-project
-./scripts/total-recall icloud-status --project my-project
+git clone https://github.com/radu2lupu/total-recall.git
+cd total-recall
+./scripts/install.sh --project my-project
 ```
+
+## What It Does
+
+Once installed, memory is fully automatic:
+
+- **Session start**: Claude queries past memories for relevant context before starting work
+- **Session end**: Claude writes a summary of what was done, decisions made, and lessons learned
+- **Mid-session**: Claude queries memory when encountering problems where prior context could help
+
+No manual commands needed. Three enforcement layers make this reliable:
+
+1. **SessionStart hook** — fires before Claude sees the user's message, forcing a memory query as the first action
+2. **CLAUDE.md instructions** — detailed rules for when to query and when to write
+3. **Stop hook** — blocks session end until a memory summary is written
+
+## Architecture
+
+```
+~/.ai-memory/knowledge/<project>/
+  ├── sessions/           # Session summaries (auto-generated)
+  │   ├── 2025-06-15-auth-refactor.md
+  │   └── imported/       # Ingested from Claude/Codex logs
+  │       ├── claude/
+  │       └── codex/
+  ├── decisions/          # Architectural decisions
+  ├── patterns/           # Reusable patterns
+  ├── bugs/               # Bug investigations
+  └── MEMORY.md           # Project-level notes
+```
+
+Each memory file contains structured metadata — date, machine, project, topic — and is indexed by qmd for hybrid BM25 + vector search.
+
+## Multi-Machine Setup
+
+Share memories across machines on the same network using the built-in HTTP server.
+
+### On the server machine
+
+```bash
+total-recall server init          # Generate API key
+total-recall server start         # Start on port 7899
+total-recall server install-launchd  # Auto-start on boot (macOS)
+```
+
+### On client machines
+
+```bash
+total-recall client configure \
+  --server-url http://server.tailscale:7899 \
+  --api-key tr_sk_...
+
+total-recall client status        # Verify connection
+```
+
+Once configured, all `write`, `query`, and `ingest` commands route to the server automatically. If the server is unreachable, operations fall back to local qmd.
+
+### Web UI
+
+The server includes a web UI at `http://server:7899/` for browsing, viewing, editing, and deleting memories. Memories are grouped by project with metadata pills showing date, machine, and source tool.
+
+## All Commands
+
+```
+total-recall install    --project NAME   Full setup: shared dirs, symlinks, qmd, hooks, ingestion
+total-recall write      --project NAME   "<summary>"  Write a memory note
+total-recall query      --project NAME   "<query>"    Semantic search across memories
+total-recall ingest     --project NAME   Import Claude/Codex session logs
+total-recall status     --project NAME   Show memory stats and configuration
+total-recall setup      --project NAME   Link dirs + configure qmd (no ingestion)
+
+total-recall icloud-enable   --project NAME   Move memory to iCloud Drive
+total-recall icloud-sync     --project NAME   Manual iCloud push/pull
+total-recall icloud-status   --project NAME   Check iCloud sync state
+
+total-recall server init              Generate server config + API key
+total-recall server start             Start HTTP API server
+total-recall server stop              Stop the server
+total-recall server status            Check if server is running
+total-recall server add-key           Generate additional API key
+total-recall server install-launchd   Auto-start on boot (macOS)
+
+total-recall client configure         Connect to a remote server
+total-recall client status            Check client connection
+total-recall client enable            Re-enable remote mode
+total-recall client disable           Switch back to local mode
+```
+
+### Plugin Slash Commands
+
+When installed as a Claude Code plugin:
+
+- `/memory-setup` — Interactive setup wizard for the current project
+- `/memory-write` — Write a session summary to memory
+- `/memory-rebuild` — Rebuild memory from git history and Codex sessions
 
 ## Install Options
 
 ```bash
-./scripts/total-recall install --project my-project --interval-minutes 10
-./scripts/total-recall install --project my-project --no-icloud
-./scripts/total-recall install --project my-project --no-launch-agent
-./scripts/total-recall install --project my-project --skip-embed
+total-recall install --project my-project --no-icloud          # Skip iCloud backup
+total-recall install --project my-project --no-launch-agent    # Skip background sync
+total-recall install --project my-project --interval-minutes 10 # Sync every 10 min
+total-recall install --project my-project --skip-embed         # Skip vector embeddings
 ```
 
-## How It Enforces Consistent Memory Usage
+## Environment Variables
 
-The hardest part of cross-session memory isn't the storage — it's getting Claude to
-actually **use** it every time. Total Recall uses three reinforcement layers:
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `TOTAL_RECALL_SHARED_ROOT` | `~/.ai-memory/knowledge` | Base directory for all project memories |
+| `TOTAL_RECALL_ICLOUD_ROOT` | `~/Library/Mobile Documents/.../AI-Memory/knowledge` | iCloud sync directory |
+| `TOTAL_RECALL_STATE_ROOT` | `~/.ai-memory/state` | Ingestion state tracking |
+| `TOTAL_RECALL_SERVER_URL` | — | Override client server URL |
+| `TOTAL_RECALL_API_KEY` | — | Override client API key |
+| `TOTAL_RECALL_SYNC_INTERVAL_MINUTES` | `15` | Background sync interval |
 
-### 1. SessionStart hook (strongest signal)
-A `SessionStart` hook fires when every session begins and injects context telling
-Claude that its **first action** must be to run `total-recall query`. This fires before
-Claude even sees the user's first message, so there's no "eager to jump into the task"
-failure mode.
+## Requirements
 
-### 2. CLAUDE.md instruction block
-The `install` command injects a detailed instruction block into `~/.claude/CLAUDE.md`
-explaining exactly **when** to query (session start, before design decisions) and
-**when not to** (mid-task with full context, trivial changes). Vague instructions like
-"query when helpful" don't work — Claude treats them as optional.
-
-### 3. Stop hook (session end)
-A `Stop` hook fires when Claude is about to finish and blocks it until it writes
-a memory summary. This ensures learnings are persisted, not lost. The hook checks
-`stop_hook_active` to prevent infinite loops — on the second firing it lets Claude end.
-
-### Why this matters
-Without these hooks, Claude consistently skips memory operations because:
-- The query "feels like a detour" before the real work (but it's actually a shortcut)
-- Writing memory at session end feels like cleanup that can be skipped
-- Vague instructions ("use memory when helpful") are interpreted as optional
-
-The hooks make it structural — Claude can't skip them even if it wants to.
-
-## Notes
-
-- Ingestion state is stored at `~/.ai-memory/state/<project>.json`.
-- Imported logs are written under:
-  - `~/.ai-memory/knowledge/<project>/sessions/imported/codex/`
-  - `~/.ai-memory/knowledge/<project>/sessions/imported/claude/`
-- Existing knowledge dirs are preserved as timestamped backups when replaced by symlinks.
-- `qmd embed` failures during cleanup are treated as non-fatal.
-- For stronger cloud security, enable Apple Advanced Data Protection.
+- macOS (iCloud + launchd features are macOS-only; core memory works anywhere)
+- [bun](https://bun.sh) (for installing qmd)
+- [qmd](https://github.com/tobi/qmd) (installed automatically)
+- Python 3.8+ (for server and session ingestion)
 
 ## License
 
