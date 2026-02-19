@@ -7,7 +7,6 @@ on:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    environment: npm
     permissions:
       contents: read
       id-token: write
@@ -16,8 +15,8 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
-          registry-url: https://registry.npmjs.org
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
 
       - name: Verify version is not already published
         run: |
@@ -27,7 +26,4 @@ jobs:
             exit 1
           fi
 
-      - name: Publish
-        run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - run: npm publish --provenance --access public
