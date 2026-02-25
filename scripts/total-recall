@@ -15,7 +15,7 @@ DEFAULT_LAUNCH_INTERVAL_MINUTES="${TOTAL_RECALL_SYNC_INTERVAL_MINUTES:-15}"
 
 usage() {
   cat <<'EOF'
-total-recall: persistent cross-session memory for Claude Code
+total-recall: persistent cross-session memory for Claude Code and Codex
 
 Usage:
   total-recall install --project NAME [options]
@@ -692,6 +692,56 @@ cmd_write() {
   }
 }
 
+run_cmd_with_timeout() {
+  local timeout_seconds="$1"
+  shift
+
+  python3 - "$timeout_seconds" "$@" <<'PY'
+import subprocess
+import sys
+
+timeout_seconds = float(sys.argv[1])
+command = sys.argv[2:]
+
+try:
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=timeout_seconds,
+    )
+except subprocess.TimeoutExpired:
+    sys.stderr.write(f"Command timed out after {int(timeout_seconds)}s: {' '.join(command)}\n")
+    raise SystemExit(124)
+except Exception:
+    raise SystemExit(125)
+
+if result.returncode == 0:
+    if result.stdout:
+        sys.stdout.write(result.stdout)
+    raise SystemExit(0)
+
+raise SystemExit(result.returncode)
+PY
+}
+
+run_memory_query() {
+  local query="$1"
+  local collection="${2:-}"
+  local qmd_timeout_seconds="${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}"
+
+  if [[ -n "$collection" ]]; then
+    run_cmd_with_timeout "$qmd_timeout_seconds" qmd query "$query" -c "$collection" && return 0
+    run_cmd_with_timeout "$qmd_timeout_seconds" qmd search "$query" -c "$collection" && return 0
+  else
+    run_cmd_with_timeout "$qmd_timeout_seconds" qmd query "$query" && return 0
+    run_cmd_with_timeout "$qmd_timeout_seconds" qmd search "$query" && return 0
+  fi
+
+  return 1
+}
+
 cmd_query() {
   local project_arg=""
   local query=""
@@ -733,16 +783,17 @@ cmd_query() {
 
   local collection
   collection="$(slugify "$(derive_project_name "$project_arg")")"
-  if qmd ls "$collection" >/dev/null 2>&1; then
-    qmd query "$query" -c "$collection" 2>/dev/null || {
-      echo "No memory available (qmd database not accessible — possibly a read-only environment). Continuing without prior context."
+  local collection_exists="0"
+  run_cmd_with_timeout 10 qmd ls "$collection" >/dev/null 2>&1 && collection_exists="1"
+
+  if [[ "$collection_exists" == "1" ]]; then
+    run_memory_query "$query" "$collection" || {
+      echo "No memory available (qmd query/search failed or timed out). Continuing without prior context."
       return 0
     }
-  else
-    qmd query "$query" 2>/dev/null || {
-      echo "No memory available (qmd database not accessible — possibly a read-only environment). Continuing without prior context."
-      return 0
-    }
+  elif ! run_memory_query "$query"; then
+    echo "No memory available (qmd query/search failed or timed out). Continuing without prior context."
+    return 0
   fi
 }
 
@@ -1030,7 +1081,7 @@ cmd_install() {
     echo "  Web UI:     $server_url/"
     echo ""
     echo "All write/query operations route to the server."
-    echo "Claude Code hooks are active — memory query at session start, write at session end."
+    echo "Claude hooks and Codex AGENTS instructions are active — memory query at session start, write at session end."
     return 0
   fi
 

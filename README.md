@@ -1,6 +1,6 @@
 # total-recall
 
-Persistent cross-session memory for Claude Code. Stores decisions, patterns, and lessons learned in a semantic search index (qmd) so every new session starts with full context of past work.
+Persistent cross-session memory for Claude Code and Codex. Stores decisions, patterns, and lessons learned in a semantic search index (qmd) so every new session starts with full context of past work.
 
 Works on a single machine with iCloud backup, or across multiple machines via a built-in HTTP server with a web UI for browsing and editing memories.
 
@@ -33,9 +33,9 @@ cd total-recall
 
 Once installed, memory is fully automatic:
 
-- **Session start**: Claude queries past memories for relevant context before starting work
-- **Session end**: Claude writes a summary of what was done, decisions made, and lessons learned
-- **Mid-session**: Claude queries memory when encountering problems where prior context could help
+- **Session start**: Claude/Codex query past memories for relevant context before starting work
+- **Session end**: Claude/Codex write a summary of what was done, decisions made, and lessons learned
+- **Mid-session**: Claude/Codex query memory when encountering problems where prior context could help
 
 No manual commands needed. Three enforcement layers make this reliable:
 

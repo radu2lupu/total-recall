@@ -12,9 +12,9 @@ Reconstruct the full session history from git commits and optionally from OpenAI
 
 - Project root: !`git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD"`
 - Project name: !`basename "$(git -C "$PWD" remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"`
-- Knowledge dir: !`PROJECT=$(basename "$(git remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"); echo "$HOME/.claude/knowledge/$PROJECT"`
+- Knowledge dir: !`PROJECT=$(basename "$(git remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"); echo "${TOTAL_RECALL_SHARED_ROOT:-$HOME/.ai-memory/knowledge}/$PROJECT"`
 - Git log summary: !`git log --oneline --since="2025-01-01" | wc -l` commits since 2025
-- Existing session files: !`PROJECT=$(basename "$(git remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"); ls "$HOME/.claude/knowledge/$PROJECT/sessions/" 2>/dev/null | wc -l` files
+- Existing session files: !`PROJECT=$(basename "$(git remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"); ROOT="${TOTAL_RECALL_SHARED_ROOT:-$HOME/.ai-memory/knowledge}"; ls "$ROOT/$PROJECT/sessions/" 2>/dev/null | wc -l` files
 - Codex sessions exist: !`ls ~/.codex/sessions/ 2>/dev/null && echo "yes" || echo "no"`
 - Arguments: $ARGUMENTS
 

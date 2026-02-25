@@ -88,7 +88,7 @@ Ask the user for the server URL and API key, then:
 
 Tell the user:
 - Setup is complete
-- Memory is fully automatic — Claude will query past memories at session start and save new ones at session end, no manual commands needed
+- Memory is fully automatic — Claude/Codex will query past memories at session start and save new ones at session end, no manual commands needed
 - If server mode: share the server URL and API key with other machines, and mention the web UI at `http://<server>:7899/`
 - If client mode: confirm the connection is active with `total-recall client status`
 - `/memory-rebuild` can optionally backfill memory from git history if they want to seed it with past work

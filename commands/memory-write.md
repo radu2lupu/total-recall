@@ -13,11 +13,11 @@ Write a summary of the current session's work to the qmd knowledge base.
 - Today's date: !`date +%Y-%m-%d`
 - Project root: !`git -C "$PWD" rev-parse --show-toplevel 2>/dev/null || echo "$PWD"`
 - Project name: !`basename "$(git -C "$PWD" remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"`
-- Knowledge dir: !`PROJECT=$(basename "$(git remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"); echo "$HOME/.claude/knowledge/$PROJECT"`
+- Knowledge dir: !`PROJECT=$(basename "$(git remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"); echo "${TOTAL_RECALL_SHARED_ROOT:-$HOME/.ai-memory/knowledge}/$PROJECT"`
 - Recent commits (last 24h): !`git log --oneline --since="24 hours ago" 2>/dev/null || echo "no recent commits"`
 - Uncommitted changes: !`git diff --stat HEAD 2>/dev/null || echo "no changes"`
 - Untracked files: !`git ls-files --others --exclude-standard 2>/dev/null | head -10`
-- Latest session file: !`PROJECT=$(basename "$(git remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"); ls -t "$HOME/.claude/knowledge/$PROJECT/sessions/" 2>/dev/null | head -1`
+- Latest session file: !`PROJECT=$(basename "$(git remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"); ROOT="${TOTAL_RECALL_SHARED_ROOT:-$HOME/.ai-memory/knowledge}"; ls -t "$ROOT/$PROJECT/sessions/" 2>/dev/null | head -1`
 - User request: $ARGUMENTS
 
 ## Your Task
