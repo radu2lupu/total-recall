@@ -1,5 +1,7 @@
 #!/bin/bash
 # SessionStart hook — tells Claude to query Total Recall before doing anything else.
+# Activates for any git repo automatically. Project name is derived from git remote
+# origin (deterministic across machines) or falls back to directory name.
 INPUT=$(cat)
 
 # Get cwd from hook input (more reliable than $PWD in hook context)
@@ -11,31 +13,24 @@ for p in "$HOME/.bun/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
   [ -d "$p" ] && export PATH="$p:$PATH"
 done
 
-# Extract project name from the total-recall instruction block in CLAUDE.md
-# This is the most reliable source — it's set during `total-recall install`
-PROJECT=""
-CLAUDE_MD="$HOME/.claude/CLAUDE.md"
-if [ -f "$CLAUDE_MD" ]; then
-  PROJECT=$(sed -n 's/.*Total Recall Auto-Memory (\([^)]*\)).*/\1/p' "$CLAUDE_MD" | head -1)
-fi
-
-# Fallback: derive from git remote or directory name
-if [ -z "$PROJECT" ]; then
-  PROJECT=$(basename "$(git -C "$CWD" remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$CWD")
-fi
-
 CLI="${CLAUDE_PLUGIN_ROOT}/scripts/total-recall"
-KNOWLEDGE_DIR="$HOME/.ai-memory/knowledge/$PROJECT"
-CLIENT_JSON="$HOME/.ai-memory/client.json"
 
-# Activate if local qmd memory exists OR if a remote server is configured
-if { [ -d "$KNOWLEDGE_DIR" ] && command -v qmd >/dev/null 2>&1; } || [ -f "$CLIENT_JSON" ]; then
-  jq -n --arg cli "$CLI" --arg project "$PROJECT" '{
-    "hookSpecificOutput": {
-      "hookEventName": "SessionStart",
-      "additionalContext": ("TOTAL RECALL MEMORY SYSTEM ACTIVE.\nYour FIRST action — before reading files, before planning, before anything — MUST be to query prior session memory:\n`" + $cli + " query --project " + $project + " \"<what the user is asking about>\"`\nThis retrieves context from all previous sessions. Without it, you will repeat past mistakes and miss prior decisions. This is mandatory, not optional.")
-    }
-  }'
+# Must have the CLI available
+if [ ! -x "$CLI" ] && ! command -v total-recall >/dev/null 2>&1; then
+  exit 0
 fi
+
+# Must have qmd installed (for local mode) or a remote client configured
+CLIENT_JSON="$HOME/.ai-memory/client.json"
+if ! command -v qmd >/dev/null 2>&1 && [ ! -f "$CLIENT_JSON" ]; then
+  exit 0
+fi
+
+jq -n --arg cli "$CLI" '{
+  "hookSpecificOutput": {
+    "hookEventName": "SessionStart",
+    "additionalContext": ("TOTAL RECALL MEMORY SYSTEM ACTIVE.\nYour FIRST action — before reading files, before planning, before anything — MUST be to query prior session memory:\n`" + $cli + " query \"<what the user is asking about>\"`\nThis retrieves context from all previous sessions. Without it, you will repeat past mistakes and miss prior decisions. This is mandatory, not optional.")
+  }
+}'
 
 exit 0

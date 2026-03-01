@@ -1,0 +1,98 @@
+[
+  {
+    "id": "inventory_allocator",
+    "title": "Inventory Allocator Edge Cases",
+    "template_dir": "tricky_inventory_template",
+    "query": "inventory allocator edge cases prior fix",
+    "focus_files": ["inventory/allocator.py"],
+    "memory_source": "qmd://gauntlet/bugs/2026-02-28-inventory-allocator-edge-cases.md:1 #gauntlet-inv",
+    "memory_title": "Bug: Fixed tricky inventory allocator edge cases",
+    "memory_bullets": [
+      "Changed active hold check to `parse_ts(hold.expires_at) > now` so holds expiring exactly now are treated as expired.",
+      "Changed sorting to `items.sort(key=lambda it: (-it.priority, parse_ts(it.created_at)))` so equal priority uses earliest created_at.",
+      "Changed allocation clamp to `take = min(item.qty, remaining)` to prevent over-allocation.",
+      "Verified with `python3 -m unittest discover -s tests -p \"test_*.py\"`."
+    ],
+    "reference_replacements": [
+      {
+        "file": "inventory/allocator.py",
+        "old": "if parse_ts(hold.expires_at) >= now:",
+        "new": "if parse_ts(hold.expires_at) > now:"
+      },
+      {
+        "file": "inventory/allocator.py",
+        "old": "items.sort(key=lambda it: (it.priority, parse_ts(it.created_at)), reverse=True)",
+        "new": "items.sort(key=lambda it: (-it.priority, parse_ts(it.created_at)))"
+      },
+      {
+        "file": "inventory/allocator.py",
+        "old": "take = min(item.qty, remaining + (1 if remaining > 0 else 0))",
+        "new": "take = min(item.qty, remaining)"
+      }
+    ]
+  },
+  {
+    "id": "pricing_engine",
+    "title": "Pricing Engine Boundaries",
+    "template_dir": "tricky_pricing_template",
+    "query": "pricing engine coupon expiry rounding shipping threshold prior fix",
+    "focus_files": ["pricing/engine.py"],
+    "memory_source": "qmd://gauntlet/bugs/2026-03-01-pricing-engine-boundary-fix.md:1 #gauntlet-price",
+    "memory_title": "Bug: Fixed pricing coupon/rounding/shipping boundaries",
+    "memory_bullets": [
+      "Treat coupons expiring exactly at now as expired (`expires_at > now`).",
+      "Round percentage discount to nearest cent with `round` before int cast.",
+      "Use `>=` for free-shipping threshold checks.",
+      "Verified with `python3 -m unittest discover -s tests -p \"test_*.py\"`."
+    ],
+    "reference_replacements": [
+      {
+        "file": "pricing/engine.py",
+        "old": "if expires_at >= now:",
+        "new": "if expires_at > now:"
+      },
+      {
+        "file": "pricing/engine.py",
+        "old": "percent_discount = int(subtotal * (percent_off / 100.0))",
+        "new": "percent_discount = int(round(subtotal * (percent_off / 100.0)))"
+      },
+      {
+        "file": "pricing/engine.py",
+        "old": "if free_shipping_at is not None and discounted > free_shipping_at:",
+        "new": "if free_shipping_at is not None and discounted >= free_shipping_at:"
+      }
+    ]
+  },
+  {
+    "id": "token_bucket",
+    "title": "Token Bucket Precision",
+    "template_dir": "tricky_token_bucket_template",
+    "query": "token bucket boundary refill precision available_at prior bug fix",
+    "focus_files": ["limiter/token_bucket.py"],
+    "memory_source": "qmd://gauntlet/bugs/2026-03-01-token-bucket-precision-fix.md:1 #gauntlet-bucket",
+    "memory_title": "Bug: Fixed token bucket precision and boundary checks",
+    "memory_bullets": [
+      "Use floating-point refill (`elapsed * rate`) instead of integer truncation.",
+      "Allow exact token boundary consumption (`tokens >= amount`).",
+      "When already available, `available_at` should return current timestamp argument.",
+      "Verified with `python3 -m unittest discover -s tests -p \"test_*.py\"`."
+    ],
+    "reference_replacements": [
+      {
+        "file": "limiter/token_bucket.py",
+        "old": "gained = int(elapsed * self.refill_per_second)",
+        "new": "gained = elapsed * self.refill_per_second"
+      },
+      {
+        "file": "limiter/token_bucket.py",
+        "old": "if self.tokens > amt:",
+        "new": "if self.tokens >= amt:"
+      },
+      {
+        "file": "limiter/token_bucket.py",
+        "old": "return self.last_refill_ts + 0.001",
+        "new": "return float(now_ts)"
+      }
+    ]
+  }
+]

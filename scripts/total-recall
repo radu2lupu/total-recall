@@ -18,31 +18,34 @@ usage() {
 total-recall: persistent cross-session memory for Claude Code and Codex
 
 Usage:
-  total-recall install --project NAME [options]
-  total-recall write "<summary>" --project NAME
-  total-recall query "<query>" --project NAME
-  total-recall status --project NAME
-  total-recall ingest --project NAME
+  total-recall write "<summary>" [--project NAME]
+  total-recall query "<query>" [--project NAME]
+  total-recall install [--project NAME] [options]
+  total-recall status [--project NAME]
+  total-recall ingest [--project NAME]
   total-recall server {init|start|stop|status|add-key|install-launchd}
   total-recall client {configure --server-url URL --api-key KEY|status|disable|enable}
 
+Project name is auto-detected from the git remote origin (deterministic across
+machines). Use --project to override.
+
 Install modes:
   Standalone (default):
-    total-recall install --project NAME
+    total-recall install [--project NAME]
     Sets up local memory, hooks, ingestion, iCloud backup, and background sync.
 
   Server (host memory for multiple machines):
-    total-recall install --project NAME --server [--port PORT]
+    total-recall install --server [--project NAME] [--port PORT]
     Full local setup + starts HTTP server with web UI + auto-start on boot.
     Prints API key and connection instructions for client machines.
 
   Client (connect to a remote server):
-    total-recall install --project NAME --client --server-url URL --api-key KEY
+    total-recall install --client --server-url URL --api-key KEY [--project NAME]
     Lightweight setup: hooks + instruction injection only. No local qmd needed.
     All write/query operations route to the server automatically.
 
 Install options:
-  --project NAME         Project name (or auto-detected from git remote)
+  --project NAME         Project name (default: auto-detected from git remote)
   --server               Server mode: also starts HTTP API + web UI
   --client               Client mode: connect to remote server (no local qmd)
   --server-url URL       Server URL (required with --client)
@@ -61,6 +64,10 @@ Other commands:
 Environment variables:
   TOTAL_RECALL_SERVER_URL   Override client server URL
   TOTAL_RECALL_API_KEY      Override client API key
+  TOTAL_RECALL_QUERY_TOKEN_BUDGET  Token budget for optimized query output (default: 900)
+  TOTAL_RECALL_QUERY_RAW    Set to 1 to return raw qmd output without optimization
+  TOTAL_RECALL_QUERY_MIN_RESULTS  Minimum primary query hits before expanding retrieval (default: 4)
+  TOTAL_RECALL_QMD_INDEX_PREFIX  Prefix for per-project qmd index names (default: total-recall)
 EOF
 }
 
@@ -106,6 +113,19 @@ slugify() {
     out="memory"
   fi
   printf '%s' "$out"
+}
+
+qmd_index_name() {
+  local project_name="$1"
+  local prefix
+  prefix="$(slugify "${TOTAL_RECALL_QMD_INDEX_PREFIX:-total-recall}")"
+  printf '%s-%s' "$prefix" "$(slugify "$project_name")"
+}
+
+qmd_cmd() {
+  local project_name="$1"
+  shift
+  qmd --index "$(qmd_index_name "$project_name")" "$@"
 }
 
 machine_id() {
@@ -263,7 +283,7 @@ PY
 }
 
 install_instruction_blocks() {
-  local project_name="$1"
+  local project_name="$1"  # kept for backward compat; not used in generated text
   local shared_root="$2"
   local cli_path="$3"
   local claude_file="$DEFAULT_CLAUDE_HOME/CLAUDE.md"
@@ -271,14 +291,16 @@ install_instruction_blocks() {
   local start_marker="<!-- total-recall:auto:start -->"
   local end_marker="<!-- total-recall:auto:end -->"
 
+  # Universal block — no hardcoded project name. The CLI auto-derives
+  # the project from the git remote origin (deterministic across machines).
   local block
-  block="## Total Recall Auto-Memory ($project_name)
+  block="## Total Recall Auto-Memory (total-recall)
 
 ### MANDATORY — your FIRST action every session
 Before reading files, before planning, before responding to the user request —
 run this command to load context from prior sessions:
 \`\`\`
-$cli_path query --project $project_name \"<what the user is asking about>\"
+$cli_path query \"<what the user is asking about>\"
 \`\`\`
 This is not optional. Skipping it means you will repeat past mistakes, re-explore
 already-investigated code, and miss decisions that were already made. The query
@@ -288,8 +310,16 @@ takes seconds but saves entire conversations of wasted work.
 When you finish implementing a feature, fixing a bug, making a design decision,
 or learning something that would help a future session, persist it:
 \`\`\`
-$cli_path write --project $project_name \"<concise summary: what changed, why, and what you learned>\"
+$cli_path write \"<concise summary: what changed, why, and what you learned>\"
 \`\`\`
+
+### MANDATORY — before your final response in non-trivial sessions
+If you changed files, ran meaningful commands, made implementation decisions,
+or diagnosed a bug, run the write command before responding to the user:
+\`\`\`
+$cli_path write \"<concise summary: what changed, why, and what you learned>\"
+\`\`\`
+Do not ask the user to run this command.
 
 ### When to query mid-session
 - Before choosing between multiple valid approaches (prior sessions may have already tried one)
@@ -300,6 +330,10 @@ $cli_path write --project $project_name \"<concise summary: what changed, why, a
 - You already queried at session start and are mid-task with full context
 - The task is trivial (fixing a typo, adding a log statement)
 - The user gave you everything you need in their message
+
+### When NOT to write
+- The session was truly trivial (read-only exploration, no decisions, no meaningful changes)
+- You already wrote a memory note for this exact completed work
 
 Do NOT tell the user to run these commands manually. This is YOUR responsibility."
 
@@ -479,22 +513,75 @@ ensure_collection() {
   require_cmd qmd
   canonical_dir="$(abs_realpath "$shared_project_dir")"
 
-  if ! qmd ls "$collection_name" >/dev/null 2>&1; then
-    qmd collection add "$canonical_dir" --name "$collection_name" --mask "**/*.md"
+  if ! qmd_cmd "$project_name" ls "$collection_name" >/dev/null 2>&1; then
+    qmd_cmd "$project_name" collection add "$canonical_dir" --name "$collection_name" --mask "**/*.md"
   fi
 
-  if ! qmd context list 2>/dev/null | grep -Fq "$canonical_dir"; then
-    if ! qmd context add "$canonical_dir" "Shared Claude + Codex memory for project $project_name" >/dev/null 2>&1; then
-      qmd collection remove "$collection_name" >/dev/null 2>&1 || true
-      qmd collection add "$canonical_dir" --name "$collection_name" --mask "**/*.md"
-      qmd context add "$canonical_dir" "Shared Claude + Codex memory for project $project_name"
+  if ! qmd_cmd "$project_name" context list 2>/dev/null | grep -Fq "$canonical_dir"; then
+    if ! qmd_cmd "$project_name" context add "$canonical_dir" "Shared Claude + Codex memory for project $project_name" >/dev/null 2>&1; then
+      qmd_cmd "$project_name" collection remove "$collection_name" >/dev/null 2>&1 || true
+      qmd_cmd "$project_name" collection add "$canonical_dir" --name "$collection_name" --mask "**/*.md"
+      qmd_cmd "$project_name" context add "$canonical_dir" "Shared Claude + Codex memory for project $project_name"
     fi
   fi
 
-  qmd update
+  qmd_cmd "$project_name" update
   if [[ "$skip_embed" != "1" ]]; then
-    qmd embed || true
+    qmd_cmd "$project_name" embed || true
   fi
+}
+
+ensure_project_exists() {
+  local project_name="$1"
+  local shared_root="$2"
+  local shared_project_dir="$shared_root/$project_name"
+
+  # Already set up? Quick exit.
+  [[ -d "$shared_project_dir/sessions" ]] && return 0
+
+  # Create directory structure
+  safe_mkdir "$shared_project_dir/sessions"
+  safe_mkdir "$shared_project_dir/decisions"
+  safe_mkdir "$shared_project_dir/patterns"
+  safe_mkdir "$shared_project_dir/bugs"
+  local qmd_index
+  qmd_index="$(qmd_index_name "$project_name")"
+
+  # Create MEMORY.md if missing
+  if [[ ! -f "$shared_project_dir/MEMORY.md" ]]; then
+    cat >"$shared_project_dir/MEMORY.md" <<EOF
+# Shared Memory: $project_name
+
+This directory is shared by Claude Code and Codex through qmd.
+
+## Query
+- qmd --index $qmd_index search "query" -c $project_name
+- qmd --index $qmd_index vsearch "query" -c $project_name
+- qmd --index $qmd_index query "query" -c $project_name
+
+## Write
+Add markdown files under:
+- sessions/
+- decisions/
+- patterns/
+- bugs/
+
+Then run:
+- qmd --index $qmd_index update
+- qmd --index $qmd_index embed
+EOF
+  fi
+
+  # Create symlinks for Claude/Codex knowledge dirs
+  link_to_shared "$DEFAULT_CLAUDE_HOME/knowledge/$project_name" "$shared_project_dir"
+  link_to_shared "$DEFAULT_CODEX_HOME/knowledge/$project_name" "$shared_project_dir"
+
+  # Register qmd collection (if qmd available)
+  if command -v qmd >/dev/null 2>&1; then
+    ensure_collection "$(slugify "$project_name")" "$shared_project_dir" "$project_name" "0"
+  fi
+
+  echo "Auto-created project: $project_name" >&2
 }
 
 write_memory_note() {
@@ -506,45 +593,38 @@ write_memory_note() {
   [[ -n "$summary" ]] || die "write requires a summary string"
 
   local shared_project_dir="$shared_root/$project_name"
-  local sessions_dir="$shared_project_dir/sessions"
-  safe_mkdir "$sessions_dir"
+  safe_mkdir "$shared_project_dir/sessions"
+  safe_mkdir "$shared_project_dir/decisions"
+  safe_mkdir "$shared_project_dir/patterns"
+  safe_mkdir "$shared_project_dir/bugs"
+  local qmd_index
+  qmd_index="$(qmd_index_name "$project_name")"
 
-  local date_str topic filename i mid
+  local date_str mid builder_script build_json session_file promoted_count collection_name
   date_str="$(date +%Y-%m-%d)"
-  topic="$(slugify "$(printf '%s' "$summary" | cut -d' ' -f1-6)")"
   mid="$(machine_id)"
-  filename="$sessions_dir/$date_str-$topic.md"
-  i=2
-  while [[ -e "$filename" ]]; do
-    filename="$sessions_dir/$date_str-$topic-$i.md"
-    i=$((i + 1))
-  done
+  builder_script="$(script_dir)/memory_note_builder.py"
+  [[ -f "$builder_script" ]] || die "Missing memory note builder: $builder_script"
 
-  cat >"$filename" <<EOF
-# Session: ${summary}
+  if ! build_json="$(python3 "$builder_script" write \
+    --project-dir "$shared_project_dir" \
+    --project "$project_name" \
+    --summary "$summary" \
+    --machine "$mid" \
+    --date "$date_str")"; then
+    die "Failed to build memory note"
+  fi
 
-**Date:** ${date_str}
-**Project:** ${project_name}
-**Machine:** ${mid}
-**Topic:** ${topic}
-**Tool:** Claude Code / Codex
+  session_file="$(python3 -c "import json,sys; print(json.load(sys.stdin).get('session_file',''))" <<<"$build_json")"
+  promoted_count="$(python3 -c "import json,sys; print(len(json.load(sys.stdin).get('promoted_files', [])))" <<<"$build_json")"
+  [[ -n "$session_file" ]] || die "Memory note builder returned no session file"
 
-## What Was Done
-- ${summary}
-
-## Decisions Made
-- (auto-generated note)
-
-## Lessons Learned
-- Keep memory notes concise and include concrete file paths or commands when relevant.
-EOF
-
-  local collection_name
   collection_name="$(slugify "$project_name")"
-  qmd update
-  qmd embed || true
+  qmd_cmd "$project_name" update
+  qmd_cmd "$project_name" embed || true
 
-  echo "Wrote memory: $filename"
+  echo "Wrote memory: $session_file"
+  echo "Promoted durable notes: $promoted_count"
   echo "Collection: $collection_name"
 }
 
@@ -616,9 +696,9 @@ cmd_setup() {
 This directory is shared by Claude Code and Codex through qmd.
 
 ## Query
-- qmd search "query" -c $project_name
-- qmd vsearch "query" -c $project_name
-- qmd query "query" -c $project_name
+- qmd --index $qmd_index search "query" -c $project_name
+- qmd --index $qmd_index vsearch "query" -c $project_name
+- qmd --index $qmd_index query "query" -c $project_name
 
 ## Write
 Add markdown files under:
@@ -628,8 +708,8 @@ Add markdown files under:
 - bugs/
 
 Then run:
-- qmd update
-- qmd embed
+- qmd --index $qmd_index update
+- qmd --index $qmd_index embed
 EOF
   fi
 
@@ -686,6 +766,7 @@ cmd_write() {
     echo "Warning: Server unreachable; falling back to local write." >&2
   fi
 
+  ensure_project_exists "$project_name" "$shared_root"
   write_memory_note "$project_name" "$shared_root" "$summary" || {
     echo "Could not write memory (filesystem may be read-only). Summary not persisted."
     return 0
@@ -729,17 +810,94 @@ PY
 run_memory_query() {
   local query="$1"
   local collection="${2:-}"
+  local project_name="${3:-}"
   local qmd_timeout_seconds="${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}"
+  local out=""
 
   if [[ -n "$collection" ]]; then
-    run_cmd_with_timeout "$qmd_timeout_seconds" qmd query "$query" -c "$collection" && return 0
-    run_cmd_with_timeout "$qmd_timeout_seconds" qmd search "$query" -c "$collection" && return 0
+    out="$(run_cmd_with_timeout "$qmd_timeout_seconds" qmd --index "$(qmd_index_name "$project_name")" query "$query" -c "$collection" || true)"
+    if [[ -n "$out" ]] && [[ "$(count_qmd_entries "$out")" -gt 0 ]]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    out="$(run_cmd_with_timeout "$qmd_timeout_seconds" qmd --index "$(qmd_index_name "$project_name")" search "$query" -c "$collection" || true)"
+    if [[ -n "$out" ]] && [[ "$(count_qmd_entries "$out")" -gt 0 ]]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
   else
-    run_cmd_with_timeout "$qmd_timeout_seconds" qmd query "$query" && return 0
-    run_cmd_with_timeout "$qmd_timeout_seconds" qmd search "$query" && return 0
+    out="$(run_cmd_with_timeout "$qmd_timeout_seconds" qmd --index "$(qmd_index_name "$project_name")" query "$query" || true)"
+    if [[ -n "$out" ]] && [[ "$(count_qmd_entries "$out")" -gt 0 ]]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
+    out="$(run_cmd_with_timeout "$qmd_timeout_seconds" qmd --index "$(qmd_index_name "$project_name")" search "$query" || true)"
+    if [[ -n "$out" ]] && [[ "$(count_qmd_entries "$out")" -gt 0 ]]; then
+      printf '%s\n' "$out"
+      return 0
+    fi
   fi
 
   return 1
+}
+
+count_qmd_entries() {
+  python3 - "$1" <<'PY'
+import re
+import sys
+
+text = sys.argv[1]
+print(len(re.findall(r"(?m)^qmd://", text)))
+PY
+}
+
+run_expanded_memory_query() {
+  local query="$1"
+  local collection="${2:-}"
+  local project_name="${3:-}"
+  local min_results="${TOTAL_RECALL_QUERY_MIN_RESULTS:-4}"
+  local primary expanded_search expanded_vsearch primary_count
+
+  primary="$(run_memory_query "$query" "$collection" "$project_name" || true)"
+  primary_count="$(count_qmd_entries "$primary")"
+
+  if [[ -z "$primary" ]]; then
+    echo ""
+    return 1
+  fi
+
+  if [[ "$primary_count" -ge "$min_results" ]]; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+
+  expanded_search=""
+  expanded_vsearch=""
+  if [[ -n "$collection" ]]; then
+    expanded_search="$(run_cmd_with_timeout "${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}" qmd --index "$(qmd_index_name "$project_name")" search "$query" -c "$collection" || true)"
+    expanded_vsearch="$(run_cmd_with_timeout "${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}" qmd --index "$(qmd_index_name "$project_name")" vsearch "$query" -c "$collection" || true)"
+  else
+    expanded_search="$(run_cmd_with_timeout "${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}" qmd --index "$(qmd_index_name "$project_name")" search "$query" || true)"
+    expanded_vsearch="$(run_cmd_with_timeout "${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}" qmd --index "$(qmd_index_name "$project_name")" vsearch "$query" || true)"
+  fi
+
+  printf '%s\n\n%s\n\n%s\n' "$primary" "$expanded_search" "$expanded_vsearch"
+}
+
+optimize_memory_output() {
+  local query="$1"
+  local raw_output="$2"
+  local optimizer_script
+  optimizer_script="$(script_dir)/memory_query_optimizer.py"
+
+  if [[ ! -f "$optimizer_script" ]]; then
+    printf '%s\n' "$raw_output"
+    return 0
+  fi
+
+  if ! printf '%s\n' "$raw_output" | python3 "$optimizer_script" --query "$query"; then
+    printf '%s\n' "$raw_output"
+  fi
 }
 
 cmd_query() {
@@ -781,20 +939,29 @@ cmd_query() {
     return 0
   fi
 
-  local collection
-  collection="$(slugify "$(derive_project_name "$project_arg")")"
+  local project_name collection shared_project_dir
+  project_name="$(derive_project_name "$project_arg")"
+  collection="$(slugify "$project_name")"
+  shared_project_dir="$(abs_realpath "$DEFAULT_SHARED_ROOT")/$project_name"
   local collection_exists="0"
-  run_cmd_with_timeout 10 qmd ls "$collection" >/dev/null 2>&1 && collection_exists="1"
+  run_cmd_with_timeout 10 qmd --index "$(qmd_index_name "$project_name")" ls "$collection" >/dev/null 2>&1 && collection_exists="1"
+  if [[ "$collection_exists" != "1" && -d "$shared_project_dir" ]]; then
+    ensure_collection "$collection" "$shared_project_dir" "$project_name" "1" >/dev/null 2>&1 || true
+    run_cmd_with_timeout 10 qmd --index "$(qmd_index_name "$project_name")" ls "$collection" >/dev/null 2>&1 && collection_exists="1"
+  fi
+  local raw_results=""
 
   if [[ "$collection_exists" == "1" ]]; then
-    run_memory_query "$query" "$collection" || {
+    raw_results="$(run_expanded_memory_query "$query" "$collection" "$project_name")" || {
       echo "No memory available (qmd query/search failed or timed out). Continuing without prior context."
       return 0
     }
-  elif ! run_memory_query "$query"; then
-    echo "No memory available (qmd query/search failed or timed out). Continuing without prior context."
+  else
+    echo "No memory yet for project '$collection'. Memories will be created after the first write. Continuing without prior context."
     return 0
   fi
+
+  optimize_memory_output "$query" "$raw_results"
 }
 
 cmd_status() {
@@ -837,7 +1004,8 @@ cmd_status() {
 
   if command -v qmd >/dev/null 2>&1; then
     echo ""
-    qmd status
+    echo "QMD index: $(qmd_index_name "$project_name")"
+    qmd_cmd "$project_name" status
   else
     echo "qmd not installed"
   fi
@@ -893,7 +1061,7 @@ cmd_ingest() {
   safe_mkdir "$shared_project_dir"
   safe_mkdir "$(dirname "$state_file")"
 
-  if ! qmd ls "$collection_name" >/dev/null 2>&1; then
+  if ! qmd_cmd "$project_name" ls "$collection_name" >/dev/null 2>&1; then
     ensure_collection "$collection_name" "$shared_project_dir" "$project_name" "1"
   fi
 
@@ -911,9 +1079,9 @@ cmd_ingest() {
   total_written=$((codex_written + claude_written))
 
   if (( total_written > 0 )); then
-    qmd update
+    qmd_cmd "$project_name" update
     if [[ "$skip_embed" != "1" ]]; then
-      qmd embed || true
+      qmd_cmd "$project_name" embed || true
     fi
   fi
 
@@ -1311,7 +1479,7 @@ cmd_icloud_sync() {
     sync_dirs_mirror "$cloud_project" "$local_project"
   fi
 
-  qmd update
+  qmd_cmd "$project_name" update
   echo "iCloud sync complete ($direction)."
 }
 

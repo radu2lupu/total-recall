@@ -14,8 +14,48 @@ import sys
 import threading
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import urlparse, parse_qs, unquote
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+try:
+    from memory_query_optimizer import optimize_qmd_output
+except Exception:  # pragma: no cover - safe fallback if module missing
+    def optimize_qmd_output(raw: str, query: str, token_budget: int = 900) -> str:
+        return (raw or "").strip()
+
+try:
+    from memory_note_builder import write_memory_files
+except Exception:  # pragma: no cover - safe fallback if module missing
+    def write_memory_files(project_dir: Path, project: str, summary: str, machine: str, date_str: Optional[str] = None) -> dict:
+        date_str = date_str or date.today().isoformat()
+        sessions_dir = project_dir / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        topic = slugify(" ".join(summary.split()[:6]))
+        filename = sessions_dir / f"{date_str}-{topic}.md"
+        i = 2
+        while filename.exists():
+            filename = sessions_dir / f"{date_str}-{topic}-{i}.md"
+            i += 1
+        content = (
+            f"# Session: {summary}\n\n"
+            f"**Date:** {date_str}\n"
+            f"**Project:** {project}\n"
+            f"**Machine:** {machine}\n"
+            f"**Topic:** {topic}\n"
+            f"**Tool:** Claude Code / Codex\n\n"
+            f"## What Was Done\n"
+            f"- {summary}\n\n"
+            f"## Decisions Made\n"
+            f"- (auto-generated note)\n\n"
+            f"## Lessons Learned\n"
+            f"- Keep memory notes concise and include concrete file paths or commands when relevant.\n"
+        )
+        filename.write_text(content, encoding="utf-8")
+        return {"session_file": str(filename), "promoted_files": []}
 
 MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
 DEFAULT_PORT = 7899
@@ -28,6 +68,11 @@ DEFAULT_PORT = 7899
 def slugify(value: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
     return re.sub(r"-+", "-", slug) or "memory"
+
+
+def qmd_index_name(project: str) -> str:
+    prefix = slugify(os.getenv("TOTAL_RECALL_QMD_INDEX_PREFIX", "total-recall"))
+    return f"{prefix}-{slugify(project)}"
 
 
 def machine_id() -> str:
@@ -50,7 +95,7 @@ def load_config(path: str) -> dict:
     return config
 
 
-def run_qmd(*args, timeout=120):
+def run_qmd(*args, project: Optional[str] = None, timeout=120):
     """Run a qmd command and return (returncode, stdout, stderr)."""
     env = os.environ.copy()
     for p in [
@@ -60,9 +105,14 @@ def run_qmd(*args, timeout=120):
     ]:
         if os.path.isdir(p) and p not in env.get("PATH", ""):
             env["PATH"] = p + ":" + env.get("PATH", "")
+    command = ["qmd"]
+    if project:
+        command.extend(["--index", qmd_index_name(project)])
+    command.extend(list(args))
+
     try:
         result = subprocess.run(
-            ["qmd", *args],
+            command,
             capture_output=True, text=True, timeout=timeout, env=env,
         )
         return result.returncode, result.stdout, result.stderr
@@ -70,6 +120,46 @@ def run_qmd(*args, timeout=120):
         return 1, "", "qmd not found"
     except subprocess.TimeoutExpired:
         return 1, "", "qmd timed out"
+
+
+def count_qmd_entries(text: str) -> int:
+    return len(re.findall(r"(?m)^qmd://", text or ""))
+
+
+def run_expanded_query(query: str, collection: str, project: Optional[str] = None) -> str:
+    min_results = int(os.getenv("TOTAL_RECALL_QUERY_MIN_RESULTS", "4"))
+    outputs: List[str] = []
+
+    if collection:
+        rc, stdout, _ = run_qmd("query", query, "-c", collection, project=project)
+        if rc != 0 or not stdout.strip():
+            rc, stdout, _ = run_qmd("search", query, "-c", collection, project=project)
+    else:
+        rc, stdout, _ = run_qmd("query", query, project=project)
+        if rc != 0 or not stdout.strip():
+            rc, stdout, _ = run_qmd("search", query, project=project)
+
+    if stdout.strip() and (rc == 0 or count_qmd_entries(stdout) > 0):
+        outputs.append(stdout.strip())
+    else:
+        return ""
+
+    if count_qmd_entries(outputs[0]) >= min_results:
+        return outputs[0]
+
+    if collection:
+        rc_s, out_s, _ = run_qmd("search", query, "-c", collection, project=project)
+        rc_v, out_v, _ = run_qmd("vsearch", query, "-c", collection, project=project)
+    else:
+        rc_s, out_s, _ = run_qmd("search", query, project=project)
+        rc_v, out_v, _ = run_qmd("vsearch", query, project=project)
+
+    if out_s.strip() and (rc_s == 0 or count_qmd_entries(out_s) > 0):
+        outputs.append(out_s.strip())
+    if out_v.strip() and (rc_v == 0 or count_qmd_entries(out_v) > 0):
+        outputs.append(out_v.strip())
+
+    return "\n\n".join(outputs)
 
 
 def safe_rel_path(rel_path: str) -> Optional[str]:
@@ -730,6 +820,32 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^/api/v1/projects/([^/]+)/" + re.escape(suffix) + r"$", path)
         return unquote(m.group(1)) if m else None
 
+    def ensure_project_collection(self, project: str) -> str:
+        """Ensure qmd collection/context exists for this project's qmd index."""
+        shared_root = self.server.config["shared_root"]
+        project_dir = os.path.join(shared_root, project)
+        os.makedirs(project_dir, exist_ok=True)
+        collection = slugify(project)
+
+        rc_ls, _, _ = run_qmd("ls", collection, project=project)
+        if rc_ls != 0:
+            run_qmd(
+                "collection", "add", project_dir,
+                "--name", collection,
+                "--mask", "**/*.md",
+                project=project,
+            )
+
+        rc_ctx, ctx_out, _ = run_qmd("context", "list", project=project)
+        if rc_ctx != 0 or project_dir not in (ctx_out or ""):
+            run_qmd(
+                "context", "add", project_dir,
+                f"Shared Claude + Codex memory for project {project}",
+                project=project,
+            )
+
+        return collection
+
     # -- routing ------------------------------------------------------------
 
     def do_GET(self):
@@ -968,8 +1084,9 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
             f.write(content)
 
         with self.server.qmd_lock:
-            run_qmd("update")
-            run_qmd("embed")
+            self.ensure_project_collection(project)
+            run_qmd("update", project=project)
+            run_qmd("embed", project=project)
 
         self.send_json({"status": "ok", "path": rel_path})
 
@@ -1001,7 +1118,8 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
         os.remove(full_path)
 
         with self.server.qmd_lock:
-            run_qmd("update")
+            self.ensure_project_collection(project)
+            run_qmd("update", project=project)
 
         self.send_json({"status": "ok", "path": rel_path, "deleted": True})
 
@@ -1027,42 +1145,19 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
 
         shared_root = self.server.config["shared_root"]
         project_dir = os.path.join(shared_root, project)
-        sessions_dir = os.path.join(project_dir, "sessions")
-        os.makedirs(sessions_dir, exist_ok=True)
-
-        date_str = date.today().isoformat()
-        topic = slugify(" ".join(summary.split()[:6]))
-        filename = os.path.join(sessions_dir, f"{date_str}-{topic}.md")
-        i = 2
-        while os.path.exists(filename):
-            filename = os.path.join(sessions_dir, f"{date_str}-{topic}-{i}.md")
-            i += 1
-
-        content = (
-            f"# Session: {summary}\n\n"
-            f"**Date:** {date_str}\n"
-            f"**Project:** {project}\n"
-            f"**Machine:** {mid}\n"
-            f"**Topic:** {topic}\n"
-            f"**Tool:** Claude Code / Codex\n\n"
-            f"## What Was Done\n"
-            f"- {summary}\n\n"
-            f"## Decisions Made\n"
-            f"- (auto-generated note)\n\n"
-            f"## Lessons Learned\n"
-            f"- Keep memory notes concise and include concrete file paths or commands when relevant.\n"
-        )
-        with open(filename, "w", encoding="utf-8") as f:
-            f.write(content)
+        os.makedirs(project_dir, exist_ok=True)
+        artifacts = write_memory_files(Path(project_dir), project=project, summary=summary, machine=mid)
 
         collection = slugify(project)
         with self.server.qmd_lock:
-            run_qmd("update")
-            run_qmd("embed")
+            self.ensure_project_collection(project)
+            run_qmd("update", project=project)
+            run_qmd("embed", project=project)
 
         self.send_json({
             "status": "ok",
-            "file": filename,
+            "file": artifacts.get("session_file"),
+            "promoted_files": artifacts.get("promoted_files", []),
             "collection": collection,
         })
 
@@ -1084,17 +1179,20 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
 
         collection = slugify(project) if project else ""
 
+        stdout = ""
         if collection:
-            rc_ls, _, _ = run_qmd("ls", collection)
-            if rc_ls == 0:
-                rc, stdout, _ = run_qmd("query", query, "-c", collection)
-            else:
-                rc, stdout, _ = run_qmd("query", query)
+            with self.server.qmd_lock:
+                rc_ls, _, _ = run_qmd("ls", collection, project=project)
+                if rc_ls != 0:
+                    self.ensure_project_collection(project)
+                stdout = run_expanded_query(query, collection, project=project)
         else:
-            rc, stdout, _ = run_qmd("query", query)
+            stdout = run_expanded_query(query, "")
 
-        if rc == 0 and stdout.strip():
-            self.send_json({"status": "ok", "results": stdout.strip()})
+        if stdout.strip():
+            token_budget = int(os.getenv("TOTAL_RECALL_QUERY_TOKEN_BUDGET", "900"))
+            optimized = optimize_qmd_output(stdout, query, token_budget=token_budget)
+            self.send_json({"status": "ok", "results": optimized})
         else:
             self.send_json({"status": "ok", "results": "No memory available."})
 
@@ -1144,8 +1242,9 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
 
         if written > 0:
             with self.server.qmd_lock:
-                run_qmd("update")
-                run_qmd("embed")
+                self.ensure_project_collection(project)
+                run_qmd("update", project=project)
+                run_qmd("embed", project=project)
 
         self.send_json({
             "status": "ok",
