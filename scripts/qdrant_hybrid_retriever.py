@@ -148,7 +148,7 @@ def load_project_docs(project: str, shared_root: Optional[str] = None) -> List[M
         if not title:
             title = Path(rel).stem.replace("-", " ")
 
-        source = f"qmd://{project}/{rel}"
+        source = f"tr://{project}/{rel}"
         docs.append(
             MemoryDoc(
                 id=next_id,
@@ -470,7 +470,7 @@ def generate_real_queries(docs: Sequence[MemoryDoc], limit: int = 24) -> List[Tu
 
 
 def canonicalize_source(source: str) -> str:
-    m = re.match(r"^(qmd://[^\s:]+(?:/[^\s:]+)+)", source.strip())
+    m = re.match(r"^(tr://[^\s:]+(?:/[^\s:]+)+)", source.strip())
     return m.group(1) if m else source.strip()
 
 

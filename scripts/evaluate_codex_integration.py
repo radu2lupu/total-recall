@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -71,25 +70,11 @@ def check_agents_file(path: Path) -> List[CheckResult]:
     return checks
 
 
-def check_codex_config(path: Path, required: bool) -> List[CheckResult]:
-    checks: List[CheckResult] = []
-    if not path.exists():
-        return [CheckResult("codex_config_exists", False, f"missing: {path}", required=required)]
-
-    text = path.read_text(encoding="utf-8")
-    checks.append(CheckResult("codex_qmd_section", bool(re.search(r"(?m)^\[mcp_servers\.qmd\]\s*$", text)), str(path), required=required))
-    checks.append(CheckResult("codex_qmd_command", bool(re.search(r'(?m)^\s*command\s*=\s*["\']qmd["\']\s*$', text)), "command = qmd", required=required))
-    checks.append(CheckResult("codex_qmd_args_mcp", bool(re.search(r'(?m)^\s*args\s*=\s*\[[^\]]*["\']mcp["\'][^\]]*\]\s*$', text)), 'args include "mcp"', required=required))
-    return checks
-
-
-def evaluate_integration(home: Path, project: str, run_query_smoke: bool, require_mcp: bool) -> List[CheckResult]:
+def evaluate_integration(home: Path, project: str, run_query_smoke: bool) -> List[CheckResult]:
     codex_home = Path(os.getenv("CODEX_HOME", str(home / ".codex")))
     codex_agents = codex_home / "AGENTS.md"
-    codex_config = codex_home / "config.toml"
     checks = []
     checks.extend(check_agents_file(codex_agents))
-    checks.extend(check_codex_config(codex_config, required=require_mcp))
 
     cli_link = home / ".local" / "bin" / "total-recall"
     checks.append(CheckResult("cli_symlink_exists", cli_link.exists(), str(cli_link)))
@@ -136,7 +121,7 @@ def sandbox_install_and_verify(project: str) -> List[CheckResult]:
         old_codex_home = os.environ.get("CODEX_HOME")
         try:
             os.environ["CODEX_HOME"] = str(home / ".codex")
-            checks.extend(evaluate_integration(home=home, project=project, run_query_smoke=True, require_mcp=False))
+            checks.extend(evaluate_integration(home=home, project=project, run_query_smoke=True))
         finally:
             if old_codex_home is None:
                 os.environ.pop("CODEX_HOME", None)
@@ -148,8 +133,7 @@ def sandbox_install_and_verify(project: str) -> List[CheckResult]:
 
 def local_verify(project: str, run_query_smoke: bool) -> List[CheckResult]:
     home = Path.home()
-    require_mcp = True
-    return evaluate_integration(home=home, project=project, run_query_smoke=run_query_smoke, require_mcp=require_mcp)
+    return evaluate_integration(home=home, project=project, run_query_smoke=run_query_smoke)
 
 
 def main() -> int:

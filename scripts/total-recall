@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Ensure bun-installed globals (like qmd) are on PATH
+# Ensure common global bin paths are on PATH
 for p in "$HOME/.bun/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
   [[ -d "$p" ]] && [[ ":$PATH:" != *":$p:"* ]] && export PATH="$p:$PATH"
 done
@@ -33,6 +33,7 @@ Install modes:
   Standalone (default):
     total-recall install [--project NAME]
     Sets up local memory, hooks, ingestion, iCloud backup, and background sync.
+    Auto-installs local retrieval runtime when missing.
 
   Server (host memory for multiple machines):
     total-recall install --server [--project NAME] [--port PORT]
@@ -41,23 +42,22 @@ Install modes:
 
   Client (connect to a remote server):
     total-recall install --client --server-url URL --api-key KEY [--project NAME]
-    Lightweight setup: hooks + instruction injection only. No local qmd needed.
+    Lightweight setup: hooks + instruction injection only. No local vector stack needed.
     All write/query operations route to the server automatically.
 
 Install options:
   --project NAME         Project name (default: auto-detected from git remote)
   --server               Server mode: also starts HTTP API + web UI
-  --client               Client mode: connect to remote server (no local qmd)
+  --client               Client mode: connect to remote server (no local vector runtime)
   --server-url URL       Server URL (required with --client)
   --api-key KEY          API key (required with --client)
   --port PORT            Server port (default: 7899, only with --server)
   --no-icloud            Skip iCloud backup
   --no-launch-agent      Skip background sync agent
   --interval-minutes N   Background sync interval (default: 15)
-  --skip-embed           Skip vector embeddings during setup
 
 Other commands:
-  setup      Link dirs + configure qmd (no ingestion)
+  setup      Link dirs and configure shared memory paths (no ingestion)
   ingest     Import Claude/Codex session logs
   icloud-enable/sync/status   Manage iCloud backup
 
@@ -65,9 +65,9 @@ Environment variables:
   TOTAL_RECALL_SERVER_URL   Override client server URL
   TOTAL_RECALL_API_KEY      Override client API key
   TOTAL_RECALL_QUERY_TOKEN_BUDGET  Token budget for optimized query output (default: 900)
-  TOTAL_RECALL_QUERY_RAW    Set to 1 to return raw qmd output without optimization
-  TOTAL_RECALL_QUERY_MIN_RESULTS  Minimum primary query hits before expanding retrieval (default: 4)
-  TOTAL_RECALL_QMD_INDEX_PREFIX  Prefix for per-project qmd index names (default: total-recall)
+  TOTAL_RECALL_QUERY_RAW    Set to 1 to return raw shortlist blocks without optimization
+  TOTAL_RECALL_QDRANT_URL   Optional Qdrant service URL (default: local in-memory engine)
+  TOTAL_RECALL_QDRANT_PYTHON   Python executable with qdrant-client + fastembed installed
 EOF
 }
 
@@ -113,19 +113,6 @@ slugify() {
     out="memory"
   fi
   printf '%s' "$out"
-}
-
-qmd_index_name() {
-  local project_name="$1"
-  local prefix
-  prefix="$(slugify "${TOTAL_RECALL_QMD_INDEX_PREFIX:-total-recall}")"
-  printf '%s-%s' "$prefix" "$(slugify "$project_name")"
-}
-
-qmd_cmd() {
-  local project_name="$1"
-  shift
-  qmd --index "$(qmd_index_name "$project_name")" "$@"
 }
 
 machine_id() {
@@ -244,6 +231,66 @@ canonical_cli_path() {
   printf '%s' "$HOME/.local/bin/total-recall"
 }
 
+python_has_qdrant_runtime() {
+  local py="$1"
+  if [[ "$py" == */* ]]; then
+    [[ -x "$py" ]] || return 1
+  else
+    command -v "$py" >/dev/null 2>&1 || return 1
+  fi
+  "$py" - <<'PY' >/dev/null 2>&1
+import importlib.util
+needed = ("qdrant_client", "fastembed")
+ok = all(importlib.util.find_spec(name) is not None for name in needed)
+raise SystemExit(0 if ok else 1)
+PY
+}
+
+resolve_qdrant_python() {
+  if [[ -n "${TOTAL_RECALL_QDRANT_PYTHON:-}" ]] && python_has_qdrant_runtime "$TOTAL_RECALL_QDRANT_PYTHON"; then
+    printf '%s' "$TOTAL_RECALL_QDRANT_PYTHON"
+    return 0
+  fi
+
+  local preferred=(
+    "$HOME/.ai-memory/.venv-qdrant/bin/python"
+    "$PWD/.venv-bench/bin/python"
+    "python3"
+  )
+  local py
+  for py in "${preferred[@]}"; do
+    if python_has_qdrant_runtime "$py"; then
+      printf '%s' "$py"
+      return 0
+    fi
+  done
+  return 1
+}
+
+ensure_qdrant_runtime_installed() {
+  if resolve_qdrant_python >/dev/null 2>&1; then
+    return 0
+  fi
+
+  require_cmd python3
+
+  local venv_dir="$HOME/.ai-memory/.venv-qdrant"
+  local venv_python="$venv_dir/bin/python"
+
+  if [[ ! -x "$venv_python" ]]; then
+    echo "Setting up local retrieval runtime at $venv_dir ..."
+    python3 -m venv "$venv_dir" || die "Failed to create virtualenv at $venv_dir"
+  fi
+
+  echo "Installing retrieval dependencies (qdrant-client, fastembed) ..."
+  "$venv_python" -m pip install --upgrade pip >/dev/null 2>&1 || true
+  "$venv_python" -m pip install --upgrade qdrant-client fastembed >/dev/null 2>&1 \
+    || die "Failed to install retrieval dependencies in $venv_dir"
+
+  python_has_qdrant_runtime "$venv_python" \
+    || die "Retrieval dependencies still missing in $venv_dir"
+}
+
 upsert_markdown_block() {
   local file_path="$1"
   local start_marker="$2"
@@ -283,7 +330,7 @@ PY
 }
 
 install_instruction_blocks() {
-  local project_name="$1"  # kept for backward compat; not used in generated text
+  local project_name="$1"  # currently unused in generated text
   local shared_root="$2"
   local cli_path="$3"
   local claude_file="$DEFAULT_CLAUDE_HOME/CLAUDE.md"
@@ -438,99 +485,6 @@ link_to_shared() {
   ln -s "$shared_target" "$link_path"
 }
 
-ensure_claude_settings() {
-  local claude_settings="$1"
-  safe_mkdir "$(dirname "$claude_settings")"
-
-  python3 - "$claude_settings" <<'PY'
-import json
-import os
-import sys
-
-path = os.path.expanduser(sys.argv[1])
-data = {}
-if os.path.exists(path):
-    with open(path, "r", encoding="utf-8") as f:
-        txt = f.read().strip()
-    if txt:
-        data = json.loads(txt)
-
-if not isinstance(data, dict):
-    raise SystemExit("~/.claude/settings.json must contain a JSON object")
-
-mcp = data.setdefault("mcpServers", {})
-if not isinstance(mcp, dict):
-    mcp = {}
-    data["mcpServers"] = mcp
-
-mcp["qmd"] = {"command": "qmd", "args": ["mcp"]}
-
-allowed = data.setdefault("allowedTools", [])
-if not isinstance(allowed, list):
-    allowed = []
-    data["allowedTools"] = allowed
-if "Bash(qmd *)" not in allowed:
-    allowed.append("Bash(qmd *)")
-
-with open(path, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2)
-    f.write("\n")
-PY
-}
-
-ensure_codex_settings() {
-  local codex_config="$1"
-  safe_mkdir "$(dirname "$codex_config")"
-
-  if [[ ! -f "$codex_config" ]]; then
-    cat >"$codex_config" <<'EOF'
-[mcp_servers.qmd]
-command = "qmd"
-args = ["mcp"]
-EOF
-    return
-  fi
-
-  if grep -Eq '^\[mcp_servers\.qmd\]' "$codex_config"; then
-    return
-  fi
-
-  {
-    echo ""
-    echo "[mcp_servers.qmd]"
-    echo 'command = "qmd"'
-    echo 'args = ["mcp"]'
-  } >>"$codex_config"
-}
-
-ensure_collection() {
-  local collection_name="$1"
-  local shared_project_dir="$2"
-  local project_name="$3"
-  local skip_embed="$4"
-  local canonical_dir
-
-  require_cmd qmd
-  canonical_dir="$(abs_realpath "$shared_project_dir")"
-
-  if ! qmd_cmd "$project_name" ls "$collection_name" >/dev/null 2>&1; then
-    qmd_cmd "$project_name" collection add "$canonical_dir" --name "$collection_name" --mask "**/*.md"
-  fi
-
-  if ! qmd_cmd "$project_name" context list 2>/dev/null | grep -Fq "$canonical_dir"; then
-    if ! qmd_cmd "$project_name" context add "$canonical_dir" "Shared Claude + Codex memory for project $project_name" >/dev/null 2>&1; then
-      qmd_cmd "$project_name" collection remove "$collection_name" >/dev/null 2>&1 || true
-      qmd_cmd "$project_name" collection add "$canonical_dir" --name "$collection_name" --mask "**/*.md"
-      qmd_cmd "$project_name" context add "$canonical_dir" "Shared Claude + Codex memory for project $project_name"
-    fi
-  fi
-
-  qmd_cmd "$project_name" update
-  if [[ "$skip_embed" != "1" ]]; then
-    qmd_cmd "$project_name" embed || true
-  fi
-}
-
 ensure_project_exists() {
   local project_name="$1"
   local shared_root="$2"
@@ -544,20 +498,16 @@ ensure_project_exists() {
   safe_mkdir "$shared_project_dir/decisions"
   safe_mkdir "$shared_project_dir/patterns"
   safe_mkdir "$shared_project_dir/bugs"
-  local qmd_index
-  qmd_index="$(qmd_index_name "$project_name")"
 
   # Create MEMORY.md if missing
   if [[ ! -f "$shared_project_dir/MEMORY.md" ]]; then
     cat >"$shared_project_dir/MEMORY.md" <<EOF
 # Shared Memory: $project_name
 
-This directory is shared by Claude Code and Codex through qmd.
+This directory is shared by Claude Code and Codex through Total Recall.
 
 ## Query
-- qmd --index $qmd_index search "query" -c $project_name
-- qmd --index $qmd_index vsearch "query" -c $project_name
-- qmd --index $qmd_index query "query" -c $project_name
+- total-recall query --project $project_name "query"
 
 ## Write
 Add markdown files under:
@@ -565,21 +515,12 @@ Add markdown files under:
 - decisions/
 - patterns/
 - bugs/
-
-Then run:
-- qmd --index $qmd_index update
-- qmd --index $qmd_index embed
 EOF
   fi
 
   # Create symlinks for Claude/Codex knowledge dirs
   link_to_shared "$DEFAULT_CLAUDE_HOME/knowledge/$project_name" "$shared_project_dir"
   link_to_shared "$DEFAULT_CODEX_HOME/knowledge/$project_name" "$shared_project_dir"
-
-  # Register qmd collection (if qmd available)
-  if command -v qmd >/dev/null 2>&1; then
-    ensure_collection "$(slugify "$project_name")" "$shared_project_dir" "$project_name" "0"
-  fi
 
   echo "Auto-created project: $project_name" >&2
 }
@@ -597,8 +538,6 @@ write_memory_note() {
   safe_mkdir "$shared_project_dir/decisions"
   safe_mkdir "$shared_project_dir/patterns"
   safe_mkdir "$shared_project_dir/bugs"
-  local qmd_index
-  qmd_index="$(qmd_index_name "$project_name")"
 
   local date_str mid builder_script build_json session_file promoted_count collection_name
   date_str="$(date +%Y-%m-%d)"
@@ -620,8 +559,6 @@ write_memory_note() {
   [[ -n "$session_file" ]] || die "Memory note builder returned no session file"
 
   collection_name="$(slugify "$project_name")"
-  qmd_cmd "$project_name" update
-  qmd_cmd "$project_name" embed || true
 
   echo "Wrote memory: $session_file"
   echo "Promoted durable notes: $promoted_count"
@@ -631,7 +568,6 @@ write_memory_note() {
 cmd_setup() {
   local project_arg=""
   local shared_root="$DEFAULT_SHARED_ROOT"
-  local skip_embed="0"
   local dry_run="0"
 
   while [[ $# -gt 0 ]]; do
@@ -643,10 +579,6 @@ cmd_setup() {
       --shared-root)
         shared_root="${2:-}"
         shift 2
-        ;;
-      --skip-embed)
-        skip_embed="1"
-        shift
         ;;
       --dry-run)
         dry_run="1"
@@ -678,8 +610,7 @@ cmd_setup() {
 
   if [[ "$dry_run" == "1" ]]; then
     echo "[dry-run] would create shared directories and link Claude/Codex paths"
-    echo "[dry-run] would ensure qmd MCP config in ~/.claude/settings.json and ~/.codex/config.toml"
-    echo "[dry-run] would ensure qmd collection + context + update/embed"
+    echo "[dry-run] would install instruction blocks in ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md"
     return
   fi
 
@@ -693,12 +624,10 @@ cmd_setup() {
     cat >"$shared_project_dir/MEMORY.md" <<EOF
 # Shared Memory: $project_name
 
-This directory is shared by Claude Code and Codex through qmd.
+This directory is shared by Claude Code and Codex through Total Recall.
 
 ## Query
-- qmd --index $qmd_index search "query" -c $project_name
-- qmd --index $qmd_index vsearch "query" -c $project_name
-- qmd --index $qmd_index query "query" -c $project_name
+- total-recall query --project $project_name "query"
 
 ## Write
 Add markdown files under:
@@ -706,20 +635,11 @@ Add markdown files under:
 - decisions/
 - patterns/
 - bugs/
-
-Then run:
-- qmd --index $qmd_index update
-- qmd --index $qmd_index embed
 EOF
   fi
 
   link_to_shared "$claude_project_dir" "$shared_project_dir"
   link_to_shared "$codex_project_dir" "$shared_project_dir"
-
-  ensure_claude_settings "$DEFAULT_CLAUDE_HOME/settings.json"
-  ensure_codex_settings "$DEFAULT_CODEX_HOME/config.toml"
-
-  ensure_collection "$(slugify "$project_name")" "$shared_project_dir" "$project_name" "$skip_embed"
 
   echo "Bridge setup complete."
 }
@@ -773,131 +693,29 @@ cmd_write() {
   }
 }
 
-run_cmd_with_timeout() {
-  local timeout_seconds="$1"
-  shift
+run_qdrant_memory_query() {
+  local project_name="$1"
+  local query="$2"
+  local shared_root="$3"
+  local qdrant_python query_script
+  query_script="$(script_dir)/memory_query_qdrant.py"
+  [[ -f "$query_script" ]] || die "Missing qdrant query helper: $query_script"
 
-  python3 - "$timeout_seconds" "$@" <<'PY'
-import subprocess
-import sys
-
-timeout_seconds = float(sys.argv[1])
-command = sys.argv[2:]
-
-try:
-    result = subprocess.run(
-        command,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        timeout=timeout_seconds,
-    )
-except subprocess.TimeoutExpired:
-    sys.stderr.write(f"Command timed out after {int(timeout_seconds)}s: {' '.join(command)}\n")
-    raise SystemExit(124)
-except Exception:
-    raise SystemExit(125)
-
-if result.returncode == 0:
-    if result.stdout:
-        sys.stdout.write(result.stdout)
-    raise SystemExit(0)
-
-raise SystemExit(result.returncode)
-PY
-}
-
-run_memory_query() {
-  local query="$1"
-  local collection="${2:-}"
-  local project_name="${3:-}"
-  local qmd_timeout_seconds="${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}"
-  local out=""
-
-  if [[ -n "$collection" ]]; then
-    out="$(run_cmd_with_timeout "$qmd_timeout_seconds" qmd --index "$(qmd_index_name "$project_name")" query "$query" -c "$collection" || true)"
-    if [[ -n "$out" ]] && [[ "$(count_qmd_entries "$out")" -gt 0 ]]; then
-      printf '%s\n' "$out"
-      return 0
-    fi
-    out="$(run_cmd_with_timeout "$qmd_timeout_seconds" qmd --index "$(qmd_index_name "$project_name")" search "$query" -c "$collection" || true)"
-    if [[ -n "$out" ]] && [[ "$(count_qmd_entries "$out")" -gt 0 ]]; then
-      printf '%s\n' "$out"
-      return 0
-    fi
-  else
-    out="$(run_cmd_with_timeout "$qmd_timeout_seconds" qmd --index "$(qmd_index_name "$project_name")" query "$query" || true)"
-    if [[ -n "$out" ]] && [[ "$(count_qmd_entries "$out")" -gt 0 ]]; then
-      printf '%s\n' "$out"
-      return 0
-    fi
-    out="$(run_cmd_with_timeout "$qmd_timeout_seconds" qmd --index "$(qmd_index_name "$project_name")" search "$query" || true)"
-    if [[ -n "$out" ]] && [[ "$(count_qmd_entries "$out")" -gt 0 ]]; then
-      printf '%s\n' "$out"
-      return 0
-    fi
-  fi
-
-  return 1
-}
-
-count_qmd_entries() {
-  python3 - "$1" <<'PY'
-import re
-import sys
-
-text = sys.argv[1]
-print(len(re.findall(r"(?m)^qmd://", text)))
-PY
-}
-
-run_expanded_memory_query() {
-  local query="$1"
-  local collection="${2:-}"
-  local project_name="${3:-}"
-  local min_results="${TOTAL_RECALL_QUERY_MIN_RESULTS:-4}"
-  local primary expanded_search expanded_vsearch primary_count
-
-  primary="$(run_memory_query "$query" "$collection" "$project_name" || true)"
-  primary_count="$(count_qmd_entries "$primary")"
-
-  if [[ -z "$primary" ]]; then
-    echo ""
-    return 1
-  fi
-
-  if [[ "$primary_count" -ge "$min_results" ]]; then
-    printf '%s\n' "$primary"
+  qdrant_python="$(resolve_qdrant_python || true)"
+  if [[ -z "$qdrant_python" ]]; then
+    echo "No memory available (qdrant-client not installed). Set TOTAL_RECALL_QDRANT_PYTHON or install qdrant-client + fastembed."
     return 0
   fi
 
-  expanded_search=""
-  expanded_vsearch=""
-  if [[ -n "$collection" ]]; then
-    expanded_search="$(run_cmd_with_timeout "${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}" qmd --index "$(qmd_index_name "$project_name")" search "$query" -c "$collection" || true)"
-    expanded_vsearch="$(run_cmd_with_timeout "${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}" qmd --index "$(qmd_index_name "$project_name")" vsearch "$query" -c "$collection" || true)"
-  else
-    expanded_search="$(run_cmd_with_timeout "${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}" qmd --index "$(qmd_index_name "$project_name")" search "$query" || true)"
-    expanded_vsearch="$(run_cmd_with_timeout "${TOTAL_RECALL_QMD_TIMEOUT_SECONDS:-20}" qmd --index "$(qmd_index_name "$project_name")" vsearch "$query" || true)"
-  fi
-
-  printf '%s\n\n%s\n\n%s\n' "$primary" "$expanded_search" "$expanded_vsearch"
-}
-
-optimize_memory_output() {
-  local query="$1"
-  local raw_output="$2"
-  local optimizer_script
-  optimizer_script="$(script_dir)/memory_query_optimizer.py"
-
-  if [[ ! -f "$optimizer_script" ]]; then
-    printf '%s\n' "$raw_output"
-    return 0
-  fi
-
-  if ! printf '%s\n' "$raw_output" | python3 "$optimizer_script" --query "$query"; then
-    printf '%s\n' "$raw_output"
-  fi
+  "$qdrant_python" "$query_script" \
+    --project "$project_name" \
+    --query "$query" \
+    --shared-root "$shared_root" \
+    --token-budget "${TOTAL_RECALL_QUERY_TOKEN_BUDGET:-900}" \
+    --top-k "${TOTAL_RECALL_QDRANT_TOP_K:-8}" \
+    --prefetch-k "${TOTAL_RECALL_QDRANT_PREFETCH_K:-40}" \
+    --rerank-k "${TOTAL_RECALL_QDRANT_RERANK_K:-24}" \
+    --qdrant-url "${TOTAL_RECALL_QDRANT_URL:-}"
 }
 
 cmd_query() {
@@ -934,34 +752,16 @@ cmd_query() {
     echo "Warning: Server unreachable; falling back to local query." >&2
   fi
 
-  if ! command -v qmd >/dev/null 2>&1; then
-    echo "No memory available (qmd not installed). Continuing without prior context."
-    return 0
-  fi
-
-  local project_name collection shared_project_dir
+  local project_name shared_project_dir
   project_name="$(derive_project_name "$project_arg")"
-  collection="$(slugify "$project_name")"
   shared_project_dir="$(abs_realpath "$DEFAULT_SHARED_ROOT")/$project_name"
-  local collection_exists="0"
-  run_cmd_with_timeout 10 qmd --index "$(qmd_index_name "$project_name")" ls "$collection" >/dev/null 2>&1 && collection_exists="1"
-  if [[ "$collection_exists" != "1" && -d "$shared_project_dir" ]]; then
-    ensure_collection "$collection" "$shared_project_dir" "$project_name" "1" >/dev/null 2>&1 || true
-    run_cmd_with_timeout 10 qmd --index "$(qmd_index_name "$project_name")" ls "$collection" >/dev/null 2>&1 && collection_exists="1"
-  fi
-  local raw_results=""
 
-  if [[ "$collection_exists" == "1" ]]; then
-    raw_results="$(run_expanded_memory_query "$query" "$collection" "$project_name")" || {
-      echo "No memory available (qmd query/search failed or timed out). Continuing without prior context."
-      return 0
-    }
-  else
-    echo "No memory yet for project '$collection'. Memories will be created after the first write. Continuing without prior context."
+  if [[ ! -d "$shared_project_dir" ]]; then
+    echo "No memory yet for project '$project_name'. Memories will be created after the first write. Continuing without prior context."
     return 0
   fi
 
-  optimize_memory_output "$query" "$raw_results"
+  run_qdrant_memory_query "$project_name" "$query" "$(abs_realpath "$DEFAULT_SHARED_ROOT")"
 }
 
 cmd_status() {
@@ -1002,19 +802,23 @@ cmd_status() {
     echo "Codex:  $codex_project_dir"
   fi
 
-  if command -v qmd >/dev/null 2>&1; then
-    echo ""
-    echo "QMD index: $(qmd_index_name "$project_name")"
-    qmd_cmd "$project_name" status
+  echo ""
+  echo "Backend: qdrant-hybrid"
+  if [[ -n "${TOTAL_RECALL_QDRANT_URL:-}" ]]; then
+    echo "Qdrant URL: ${TOTAL_RECALL_QDRANT_URL}"
   else
-    echo "qmd not installed"
+    echo "Qdrant URL: local in-process engine"
+  fi
+  if py="$(resolve_qdrant_python 2>/dev/null)"; then
+    echo "Qdrant Python: $py"
+  else
+    echo "Qdrant Python: not found (install qdrant-client + fastembed)"
   fi
 }
 
 cmd_ingest() {
   local project_arg=""
   local shared_root="$DEFAULT_SHARED_ROOT"
-  local skip_embed="0"
   local print_json="0"
 
   while [[ $# -gt 0 ]]; do
@@ -1026,10 +830,6 @@ cmd_ingest() {
       --shared-root)
         shared_root="${2:-}"
         shift 2
-        ;;
-      --skip-embed)
-        skip_embed="1"
-        shift
         ;;
       --json)
         print_json="1"
@@ -1045,14 +845,12 @@ cmd_ingest() {
     esac
   done
 
-  require_cmd qmd
   require_cmd python3
 
-  local project_name shared_project_dir collection_name state_file script_dir_path ingest_script
+  local project_name shared_project_dir state_file script_dir_path ingest_script
   project_name="$(derive_project_name "$project_arg")"
   shared_root="$(abs_realpath "$shared_root")"
   shared_project_dir="$shared_root/$project_name"
-  collection_name="$(slugify "$project_name")"
   state_file="$(abs_realpath "$DEFAULT_STATE_ROOT")/$project_name.json"
   script_dir_path="$(script_dir)"
   ingest_script="$script_dir_path/ingest_sessions.py"
@@ -1060,10 +858,6 @@ cmd_ingest() {
 
   safe_mkdir "$shared_project_dir"
   safe_mkdir "$(dirname "$state_file")"
-
-  if ! qmd_cmd "$project_name" ls "$collection_name" >/dev/null 2>&1; then
-    ensure_collection "$collection_name" "$shared_project_dir" "$project_name" "1"
-  fi
 
   local ingest_json
   ingest_json="$(python3 "$ingest_script" \
@@ -1077,13 +871,6 @@ cmd_ingest() {
   codex_written="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["codex"]["written"])' <<<"$ingest_json")"
   claude_written="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["claude"]["written"])' <<<"$ingest_json")"
   total_written=$((codex_written + claude_written))
-
-  if (( total_written > 0 )); then
-    qmd_cmd "$project_name" update
-    if [[ "$skip_embed" != "1" ]]; then
-      qmd_cmd "$project_name" embed || true
-    fi
-  fi
 
   # Upload newly-imported sessions to remote server if configured
   if is_remote_configured && (( total_written > 0 )); then
@@ -1143,7 +930,6 @@ cmd_install() {
   local use_icloud="1"
   local icloud_root="$DEFAULT_ICLOUD_ROOT"
   local interval_minutes="$DEFAULT_LAUNCH_INTERVAL_MINUTES"
-  local skip_embed="0"
   local no_launch_agent="0"
   local install_mode="standalone"  # standalone | server | client
   local server_url=""
@@ -1175,10 +961,6 @@ cmd_install() {
       --interval-minutes)
         interval_minutes="${2:-}"
         shift 2
-        ;;
-      --skip-embed)
-        skip_embed="1"
-        shift
         ;;
       --no-launch-agent)
         no_launch_agent="1"
@@ -1231,7 +1013,7 @@ cmd_install() {
   canonical_path="$(canonical_cli_path)"
 
   if [[ "$install_mode" == "client" ]]; then
-    # --- Client-only install: no local qmd, no local dirs ---
+    # --- Client-only install: no local vector runtime, no local dirs ---
     echo "Installing in client mode..."
     echo "Project: $project_name"
 
@@ -1257,19 +1039,16 @@ cmd_install() {
   [[ "$interval_minutes" =~ ^[0-9]+$ ]] || die "--interval-minutes must be a number"
   (( interval_minutes >= 1 )) || die "--interval-minutes must be >= 1"
 
+  ensure_qdrant_runtime_installed
   shared_root="$(abs_realpath "$shared_root")"
 
-  "$cli_path" setup --project "$project_name" --shared-root "$shared_root" --skip-embed
+  "$cli_path" setup --project "$project_name" --shared-root "$shared_root"
 
   if [[ "$use_icloud" == "1" ]]; then
-    "$cli_path" icloud-enable --project "$project_name" --shared-root "$shared_root" --icloud-root "$icloud_root" --skip-embed
+    "$cli_path" icloud-enable --project "$project_name" --shared-root "$shared_root" --icloud-root "$icloud_root"
   fi
 
-  if [[ "$skip_embed" == "1" ]]; then
-    "$cli_path" ingest --project "$project_name" --shared-root "$shared_root" --skip-embed
-  else
-    "$cli_path" ingest --project "$project_name" --shared-root "$shared_root"
-  fi
+  "$cli_path" ingest --project "$project_name" --shared-root "$shared_root"
 
   install_instruction_blocks "$project_name" "$shared_root" "$canonical_path"
 
@@ -1335,7 +1114,6 @@ cmd_icloud_enable() {
   local project_arg=""
   local shared_root="$DEFAULT_SHARED_ROOT"
   local icloud_root="$DEFAULT_ICLOUD_ROOT"
-  local skip_embed="0"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1350,10 +1128,6 @@ cmd_icloud_enable() {
       --icloud-root)
         icloud_root="${2:-}"
         shift 2
-        ;;
-      --skip-embed)
-        skip_embed="1"
-        shift
         ;;
       --help|-h)
         usage
@@ -1416,8 +1190,6 @@ cmd_icloud_enable() {
   link_to_shared "$claude_project_dir" "$local_project"
   link_to_shared "$codex_project_dir" "$local_project"
 
-  ensure_collection "$(slugify "$project_name")" "$local_project" "$project_name" "$skip_embed"
-
   echo "iCloud live backup enabled."
 }
 
@@ -1479,7 +1251,6 @@ cmd_icloud_sync() {
     sync_dirs_mirror "$cloud_project" "$local_project"
   fi
 
-  qmd_cmd "$project_name" update
   echo "iCloud sync complete ($direction)."
 }
 

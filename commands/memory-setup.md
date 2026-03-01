@@ -5,7 +5,7 @@ allowed-tools: [Bash, Read, Write, Glob]
 
 # Total Recall Setup
 
-Set up cross-session semantic memory for the current project. This runs the full `total-recall install` — shared memory, session ingestion, qmd indexing, and background sync.
+Set up cross-session semantic memory for the current project. This runs the full `total-recall install` — shared memory, session ingestion, qdrant indexing/retrieval, and background sync.
 
 ## Context
 
@@ -14,8 +14,8 @@ Set up cross-session semantic memory for the current project. This runs the full
 - Detected project name: !`basename "$(git remote get-url origin 2>/dev/null | sed 's/.*\///' | sed 's/\.git$//')" 2>/dev/null || basename "$PWD"`
 - Platform: !`uname -s`
 - iCloud Drive exists: !`[ -d "$HOME/Library/Mobile Documents/com~apple~CloudDocs" ] && echo "yes" || echo "no"`
-- qmd installed: !`command -v qmd >/dev/null 2>&1 && echo "yes" || echo "no"`
-- bun installed: !`command -v bun >/dev/null 2>&1 && echo "yes" || echo "no"`
+- python3 installed: !`command -v python3 >/dev/null 2>&1 && echo "yes" || echo "no"`
+- local qdrant runtime installed (`qdrant-client` + `fastembed`): !`python3 -c "import qdrant_client, fastembed" >/dev/null 2>&1 && echo "yes" || echo "no"`
 - Plugin root: !`echo "${CLAUDE_PLUGIN_ROOT:-unknown}"`
 - Client configured: !`[ -f "$HOME/.ai-memory/client.json" ] && echo "yes" || echo "no"`
 - Server configured: !`[ -f "$HOME/.ai-memory/server.json" ] && echo "yes" || echo "no"`
@@ -25,16 +25,8 @@ Set up cross-session semantic memory for the current project. This runs the full
 
 ### 1. Pre-flight check
 
-If `qmd` is not installed and `bun` is not installed either, stop and tell the user:
-```
-Install bun first: curl -fsSL https://bun.sh/install | bash
-Then re-run /memory-setup
-```
-
-If `bun` is available but `qmd` is not, install it:
-```bash
-bun install -g github:tobi/qmd
-```
+No manual dependency installation is required. `total-recall install` auto-bootstraps the local qdrant runtime (`qdrant-client` + `fastembed`) for **Standalone** and **Server** modes.
+If the user chooses **Client** mode, this runtime bootstrap is skipped.
 
 ### 2. Ask the user (interactive)
 

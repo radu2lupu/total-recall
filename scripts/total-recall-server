@@ -22,10 +22,9 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 try:
-    from memory_query_optimizer import optimize_qmd_output
-except Exception:  # pragma: no cover - safe fallback if module missing
-    def optimize_qmd_output(raw: str, query: str, token_budget: int = 900) -> str:
-        return (raw or "").strip()
+    from memory_query_qdrant import query_project_memories
+except Exception:  # pragma: no cover - fallback to subprocess runtime
+    query_project_memories = None
 
 try:
     from memory_note_builder import write_memory_files
@@ -70,11 +69,6 @@ def slugify(value: str) -> str:
     return re.sub(r"-+", "-", slug) or "memory"
 
 
-def qmd_index_name(project: str) -> str:
-    prefix = slugify(os.getenv("TOTAL_RECALL_QMD_INDEX_PREFIX", "total-recall"))
-    return f"{prefix}-{slugify(project)}"
-
-
 def machine_id() -> str:
     try:
         return subprocess.check_output(
@@ -95,71 +89,95 @@ def load_config(path: str) -> dict:
     return config
 
 
-def run_qmd(*args, project: Optional[str] = None, timeout=120):
-    """Run a qmd command and return (returncode, stdout, stderr)."""
-    env = os.environ.copy()
-    for p in [
-        os.path.expanduser("~/.bun/bin"),
-        "/opt/homebrew/bin",
-        "/usr/local/bin",
-    ]:
-        if os.path.isdir(p) and p not in env.get("PATH", ""):
-            env["PATH"] = p + ":" + env.get("PATH", "")
-    command = ["qmd"]
-    if project:
-        command.extend(["--index", qmd_index_name(project)])
-    command.extend(list(args))
-
+def python_has_qdrant(py: str) -> bool:
+    if not py:
+        return False
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True, text=True, timeout=timeout, env=env,
+        proc = subprocess.run(
+            [py, "-c", "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('qdrant_client') else 1)"],
+            capture_output=True,
+            text=True,
+            timeout=5,
         )
-        return result.returncode, result.stdout, result.stderr
-    except FileNotFoundError:
-        return 1, "", "qmd not found"
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
+def resolve_qdrant_python() -> Optional[str]:
+    preferred = [
+        os.getenv("TOTAL_RECALL_QDRANT_PYTHON", ""),
+        os.path.expanduser("~/.ai-memory/.venv-qdrant/bin/python"),
+        str(SCRIPT_DIR.parent / ".venv-bench" / "bin" / "python"),
+        sys.executable,
+        "python3",
+    ]
+    seen = set()
+    for py in preferred:
+        if not py or py in seen:
+            continue
+        seen.add(py)
+        if python_has_qdrant(py):
+            return py
+    return None
+
+
+def query_project_memories_via_subprocess(
+    *,
+    project: str,
+    query: str,
+    shared_root: str,
+    token_budget: int = 900,
+) -> tuple[str, dict]:
+    py = resolve_qdrant_python()
+    if not py:
+        return "No memory available (qdrant-client not installed).", {
+            "backend": "qdrant_hybrid",
+            "error": "qdrant-client not available",
+        }
+
+    helper = SCRIPT_DIR / "memory_query_qdrant.py"
+    if not helper.exists():
+        return "No memory available (missing qdrant query helper).", {
+            "backend": "qdrant_hybrid",
+            "error": "helper_missing",
+        }
+
+    cmd = [
+        py,
+        str(helper),
+        "--project",
+        project,
+        "--query",
+        query,
+        "--shared-root",
+        shared_root,
+        "--token-budget",
+        str(token_budget),
+        "--top-k",
+        str(int(os.getenv("TOTAL_RECALL_QDRANT_TOP_K", "8"))),
+        "--prefetch-k",
+        str(int(os.getenv("TOTAL_RECALL_QDRANT_PREFETCH_K", "40"))),
+        "--rerank-k",
+        str(int(os.getenv("TOTAL_RECALL_QDRANT_RERANK_K", "24"))),
+    ]
+    qdrant_url = os.getenv("TOTAL_RECALL_QDRANT_URL", "").strip()
+    if qdrant_url:
+        cmd.extend(["--qdrant-url", qdrant_url])
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
     except subprocess.TimeoutExpired:
-        return 1, "", "qmd timed out"
-
-
-def count_qmd_entries(text: str) -> int:
-    return len(re.findall(r"(?m)^qmd://", text or ""))
-
-
-def run_expanded_query(query: str, collection: str, project: Optional[str] = None) -> str:
-    min_results = int(os.getenv("TOTAL_RECALL_QUERY_MIN_RESULTS", "4"))
-    outputs: List[str] = []
-
-    if collection:
-        rc, stdout, _ = run_qmd("query", query, "-c", collection, project=project)
-        if rc != 0 or not stdout.strip():
-            rc, stdout, _ = run_qmd("search", query, "-c", collection, project=project)
-    else:
-        rc, stdout, _ = run_qmd("query", query, project=project)
-        if rc != 0 or not stdout.strip():
-            rc, stdout, _ = run_qmd("search", query, project=project)
-
-    if stdout.strip() and (rc == 0 or count_qmd_entries(stdout) > 0):
-        outputs.append(stdout.strip())
-    else:
-        return ""
-
-    if count_qmd_entries(outputs[0]) >= min_results:
-        return outputs[0]
-
-    if collection:
-        rc_s, out_s, _ = run_qmd("search", query, "-c", collection, project=project)
-        rc_v, out_v, _ = run_qmd("vsearch", query, "-c", collection, project=project)
-    else:
-        rc_s, out_s, _ = run_qmd("search", query, project=project)
-        rc_v, out_v, _ = run_qmd("vsearch", query, project=project)
-
-    if out_s.strip() and (rc_s == 0 or count_qmd_entries(out_s) > 0):
-        outputs.append(out_s.strip())
-    if out_v.strip() and (rc_v == 0 or count_qmd_entries(out_v) > 0):
-        outputs.append(out_v.strip())
-
-    return "\n\n".join(outputs)
+        return "No memory available (qdrant query timed out).", {
+            "backend": "qdrant_hybrid",
+            "error": "timeout",
+        }
+    if proc.returncode != 0:
+        return "No memory available (qdrant query failed).", {
+            "backend": "qdrant_hybrid",
+            "error": (proc.stderr or "").strip()[:240],
+        }
+    output = (proc.stdout or "").strip()
+    return output or "No memory available.", {"backend": "qdrant_hybrid"}
 
 
 def safe_rel_path(rel_path: str) -> Optional[str]:
@@ -820,32 +838,6 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
         m = re.match(r"^/api/v1/projects/([^/]+)/" + re.escape(suffix) + r"$", path)
         return unquote(m.group(1)) if m else None
 
-    def ensure_project_collection(self, project: str) -> str:
-        """Ensure qmd collection/context exists for this project's qmd index."""
-        shared_root = self.server.config["shared_root"]
-        project_dir = os.path.join(shared_root, project)
-        os.makedirs(project_dir, exist_ok=True)
-        collection = slugify(project)
-
-        rc_ls, _, _ = run_qmd("ls", collection, project=project)
-        if rc_ls != 0:
-            run_qmd(
-                "collection", "add", project_dir,
-                "--name", collection,
-                "--mask", "**/*.md",
-                project=project,
-            )
-
-        rc_ctx, ctx_out, _ = run_qmd("context", "list", project=project)
-        if rc_ctx != 0 or project_dir not in (ctx_out or ""):
-            run_qmd(
-                "context", "add", project_dir,
-                f"Shared Claude + Codex memory for project {project}",
-                project=project,
-            )
-
-        return collection
-
     # -- routing ------------------------------------------------------------
 
     def do_GET(self):
@@ -938,13 +930,16 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
                 d for d in os.listdir(shared_root)
                 if is_project_dir(shared_root, d)
             )
-        rc, stdout, _ = run_qmd("status")
+        qdrant_url = os.getenv("TOTAL_RECALL_QDRANT_URL", "").strip()
+        backend_runtime = resolve_qdrant_python()
         self.send_json({
             "status": "ok",
             "server": "total-recall",
             "machine_id": machine_id(),
             "projects": projects,
-            "qmd_status": stdout.strip() if rc == 0 else "qmd unavailable",
+            "backend": "qdrant_hybrid",
+            "qdrant_url": qdrant_url or "local in-process engine",
+            "qdrant_python": backend_runtime or "not found",
         })
 
     # -- GET /api/v1/projects -----------------------------------------------
@@ -1083,11 +1078,6 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
         with open(full_path, "w", encoding="utf-8") as f:
             f.write(content)
 
-        with self.server.qmd_lock:
-            self.ensure_project_collection(project)
-            run_qmd("update", project=project)
-            run_qmd("embed", project=project)
-
         self.send_json({"status": "ok", "path": rel_path})
 
     # -- DELETE /api/v1/projects/<name>/file?path=... -----------------------
@@ -1117,10 +1107,6 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
 
         os.remove(full_path)
 
-        with self.server.qmd_lock:
-            self.ensure_project_collection(project)
-            run_qmd("update", project=project)
-
         self.send_json({"status": "ok", "path": rel_path, "deleted": True})
 
     # -- POST /api/v1/write -------------------------------------------------
@@ -1148,17 +1134,11 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
         os.makedirs(project_dir, exist_ok=True)
         artifacts = write_memory_files(Path(project_dir), project=project, summary=summary, machine=mid)
 
-        collection = slugify(project)
-        with self.server.qmd_lock:
-            self.ensure_project_collection(project)
-            run_qmd("update", project=project)
-            run_qmd("embed", project=project)
-
         self.send_json({
             "status": "ok",
             "file": artifacts.get("session_file"),
             "promoted_files": artifacts.get("promoted_files", []),
-            "collection": collection,
+            "collection": slugify(project),
         })
 
     # -- POST /api/v1/query -------------------------------------------------
@@ -1177,24 +1157,38 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
             self.send_error_json(400, "Missing 'query'")
             return
 
-        collection = slugify(project) if project else ""
-
-        stdout = ""
-        if collection:
-            with self.server.qmd_lock:
-                rc_ls, _, _ = run_qmd("ls", collection, project=project)
-                if rc_ls != 0:
-                    self.ensure_project_collection(project)
-                stdout = run_expanded_query(query, collection, project=project)
-        else:
-            stdout = run_expanded_query(query, "")
-
-        if stdout.strip():
-            token_budget = int(os.getenv("TOTAL_RECALL_QUERY_TOKEN_BUDGET", "900"))
-            optimized = optimize_qmd_output(stdout, query, token_budget=token_budget)
-            self.send_json({"status": "ok", "results": optimized})
-        else:
+        if not project:
             self.send_json({"status": "ok", "results": "No memory available."})
+            return
+
+        token_budget = int(os.getenv("TOTAL_RECALL_QUERY_TOKEN_BUDGET", "900"))
+        shared_root = self.server.config["shared_root"]
+
+        if query_project_memories is not None:
+            try:
+                results, _ = query_project_memories(
+                    project=project,
+                    query=query,
+                    shared_root=shared_root,
+                    token_budget=token_budget,
+                    top_k=int(os.getenv("TOTAL_RECALL_QDRANT_TOP_K", "8")),
+                    prefetch_k=int(os.getenv("TOTAL_RECALL_QDRANT_PREFETCH_K", "40")),
+                    rerank_k=int(os.getenv("TOTAL_RECALL_QDRANT_RERANK_K", "24")),
+                    qdrant_url=os.getenv("TOTAL_RECALL_QDRANT_URL", "").strip() or None,
+                )
+                self.send_json({"status": "ok", "results": results})
+                return
+            except Exception:
+                # Fall back to subprocess runtime below.
+                pass
+
+        results, _ = query_project_memories_via_subprocess(
+            project=project,
+            query=query,
+            shared_root=shared_root,
+            token_budget=token_budget,
+        )
+        self.send_json({"status": "ok", "results": results})
 
     # -- POST /api/v1/ingest-upload -----------------------------------------
 
@@ -1240,12 +1234,6 @@ class TotalRecallHandler(http.server.BaseHTTPRequestHandler):
                 f.write(content)
             written += 1
 
-        if written > 0:
-            with self.server.qmd_lock:
-                self.ensure_project_collection(project)
-                run_qmd("update", project=project)
-                run_qmd("embed", project=project)
-
         self.send_json({
             "status": "ok",
             "written": written,
@@ -1264,7 +1252,6 @@ class TotalRecallServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
     def __init__(self, config: dict, *args, **kwargs):
         self.config = config
-        self.qmd_lock = threading.Lock()
         super().__init__(*args, **kwargs)
 
 

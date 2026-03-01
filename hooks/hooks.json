@@ -1,5 +1,5 @@
 {
-  "description": "Total Recall: cross-session memory persistence via qmd",
+  "description": "Total Recall: cross-session memory persistence via qdrant hybrid retrieval",
   "hooks": {
     "SessionStart": [
       {

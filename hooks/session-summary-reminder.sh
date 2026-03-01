@@ -13,7 +13,7 @@ fi
 CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
 CWD="${CWD:-$PWD}"
 
-# Ensure bun-installed globals (like qmd) are on PATH
+# Ensure common global bin paths are on PATH
 for p in "$HOME/.bun/bin" "/opt/homebrew/bin" "/usr/local/bin"; do
   [ -d "$p" ] && export PATH="$p:$PATH"
 done
@@ -22,12 +22,6 @@ CLI="${CLAUDE_PLUGIN_ROOT}/scripts/total-recall"
 
 # Must have the CLI available
 if [ ! -x "$CLI" ] && ! command -v total-recall >/dev/null 2>&1; then
-  exit 0
-fi
-
-# Must have qmd installed (for local mode) or a remote client configured
-CLIENT_JSON="$HOME/.ai-memory/client.json"
-if ! command -v qmd >/dev/null 2>&1 && [ ! -f "$CLIENT_JSON" ]; then
   exit 0
 fi
 

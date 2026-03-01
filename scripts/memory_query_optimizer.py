@@ -391,7 +391,7 @@ def _jaccard(left: set[str], right: set[str]) -> float:
 
 
 def _parse_items(raw: str, query: str) -> list[MemoryItem]:
-    entry_pattern = re.compile(r"(?ms)^(qmd://.+?)(?=^qmd://|\Z)")
+    entry_pattern = re.compile(r"(?ms)^(tr://.+?)(?=^tr://|\Z)")
     blocks = [match.group(1).strip() for match in entry_pattern.finditer(raw)]
     if not blocks:
         blocks = [block.strip() for block in re.split(r"\n{2,}", raw) if block.strip()]

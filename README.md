@@ -1,6 +1,6 @@
 # total-recall
 
-Persistent cross-session memory for Claude Code and Codex. Stores decisions, patterns, and lessons learned in a semantic search index (qmd) so every new session starts with full context of past work.
+Persistent cross-session memory for Claude Code and Codex. Stores decisions, patterns, and lessons learned in a Qdrant hybrid retrieval index (dense + sparse + rerank) so every new session starts with full context of past work.
 
 Works on a single machine with iCloud backup, or across multiple machines via a built-in HTTP server with a web UI for browsing and editing memories.
 
@@ -26,8 +26,11 @@ total-recall install --project my-project
 ```bash
 git clone https://github.com/radu2lupu/total-recall.git
 cd total-recall
-./scripts/install.sh --project my-project
+./scripts/install.sh
 ```
+
+`install.sh` is interactive by default (asks project + mode + options).  
+For scripted installs, pass flags directly (for example `./scripts/install.sh --project my-project --server`).
 
 ## What It Does
 
@@ -35,7 +38,7 @@ Once installed, memory is fully automatic:
 
 - **Session start**: Claude/Codex query past memories for relevant context before starting work
 - **Retrieval output is compact**: query results are auto-shortlisted by relevance, recency, and actionability to reduce token usage
-- **Project retrieval is isolated**: each project uses its own qmd index to reduce cross-project interference
+- **Project retrieval is isolated**: each project uses its own retrieval scope and collection naming to reduce cross-project interference
 - **Durable memories are promoted**: high-signal writes are auto-promoted to `decisions/`, `bugs/`, or `patterns/` for stronger future recall
 - **Session end**: Claude/Codex write a summary of what was done, decisions made, and lessons learned
 - **Mid-session**: Claude/Codex query memory when encountering problems where prior context could help
@@ -45,6 +48,29 @@ No manual commands needed. Enforcement layers:
 1. **SessionStart hook (Claude plugin)** — fires before Claude sees the user's message, forcing a memory query as the first action
 2. **Stop hook (Claude plugin)** — blocks session end until a memory summary is written
 3. **Instruction blocks (`CLAUDE.md` + `AGENTS.md`)** — explicit rules for when to query and when to write (used by both Claude and Codex)
+
+## Memory Management Strategy (Why Not Embedding-Only Search)
+
+This project does **not** treat memory as "dump text -> embed -> semantic search".
+It uses a memory pipeline designed for agent execution quality under token limits.
+
+What Total Recall does:
+
+- **Structured writes, not raw logs**: each memory note is written with retrieval cues (`intent`, `outcome`, `durable_signal`, `keywords`, `files`, `commands`, `cue_problem`, `cue_action`, `cue_verify`) so later retrieval has actionable signals, not just similarity.
+- **Memory type separation**: sessions (`sessions/`) capture episodic context, while promoted durable memories (`decisions/`, `patterns/`, `bugs/`) preserve long-lived semantic/procedural knowledge.
+- **Hybrid retrieval + rerank**: `query` uses dense + sparse retrieval fused with RRF, then utility reranking with overlap/recency/actionability/cues and diversity filtering.
+- **Post-retrieval re-ranking**: shortlist ranking combines semantic score with query overlap, recency decay, actionability, durable boosts, intent/cue alignment, scope checks, and distinctiveness; then applies diversity ranking (MMR) to avoid near-duplicate memories.
+- **Mode-aware output**: for bug-fix/optimization queries, the optimizer can emit a compact procedural "memory recipe" (edit targets + fix deltas + verify commands) when confidence is high; otherwise it emits a token-budgeted shortlist.
+- **Hard token budgeting**: retrieval output is constrained by `TOTAL_RECALL_QUERY_TOKEN_BUDGET`, with fallback to raw output only when optimization is not better.
+- **Project isolation by default**: each project uses its own memory directory and retrieval collection naming, reducing cross-project false positives.
+
+Why this is better than embedding-only semantic search:
+
+- **Higher precision for execution**: embedding-only often returns textually similar but non-actionable notes. Cue-aware ranking favors memories that include concrete files, commands, and verified fixes.
+- **Lower context waste**: embedding-only tends to return long, redundant blobs. Token-budgeted shortlist/recipe output keeps only the highest-utility, diverse items.
+- **Better robustness over time**: durable promotion and recency handling prevent both "old but critical decision loss" and "latest-noise dominance".
+- **Reduced false recall across repos/tasks**: scope penalties and per-project indexes reduce accidental retrieval from unrelated work.
+- **Measured real-world impact**: gauntlet benchmarks compare warm vs cold vs control runs, with repeat stability checks, instead of relying only on retrieval-score metrics.
 
 ## Architecture
 
@@ -61,7 +87,7 @@ No manual commands needed. Enforcement layers:
   └── MEMORY.md           # Project-level notes
 ```
 
-Each memory file contains structured metadata — date, machine, project, topic — and is indexed by qmd for hybrid BM25 + vector search.
+Each memory file contains structured metadata — date, machine, project, topic — and is retrieved through a Qdrant hybrid pipeline (dense + sparse + rerank).
 
 ## Multi-Machine Setup
 
@@ -83,7 +109,7 @@ This does everything: local memory setup, iCloud backup, session ingestion, hook
   --api-key tr_sk_...
 ```
 
-Client installs are lightweight — no local qmd or memory directories needed. Just the CLI, hooks, and instruction injection. All `write` and `query` operations route to the server automatically.
+Client installs are lightweight — no local vector runtime or memory directories needed. Just the CLI, hooks, and instruction injection. All `write` and `query` operations route to the server automatically.
 
 ### Web UI
 
@@ -148,12 +174,11 @@ When installed as a Claude Code plugin:
 total-recall install --project my-project --no-icloud          # Skip iCloud backup
 total-recall install --project my-project --no-launch-agent    # Skip background sync
 total-recall install --project my-project --interval-minutes 10 # Sync every 10 min
-total-recall install --project my-project --skip-embed         # Skip vector embeddings
 
 # Server options
 total-recall install --project my-project --server --port 8080 # Custom port
 
-# Client (no local qmd or bun needed)
+# Client (no local vector runtime needed)
 total-recall install --project my-project --client \
   --server-url http://server:7899 --api-key tr_sk_...
 ```
@@ -162,7 +187,6 @@ total-recall install --project my-project --client \
 
 Run a deterministic integration check to ensure Codex has:
 - Total Recall instructions in `~/.codex/AGENTS.md`
-- qmd MCP wiring in `~/.codex/config.toml` (required for local standalone/server mode; optional in client-mode sandbox checks)
 - working `total-recall query` command path
 
 ```bash
@@ -190,21 +214,14 @@ python3 scripts/evaluate_agent_gauntlet_suite.py --mode agent --repeats 2 --orde
 python3 scripts/evaluate_agent_gauntlet_suite.py --mode agent --repeats 2 --order-policy alternate --no-focus-alignment-gate --agent-timeout-seconds 240 --json
 # Fast deterministic sanity check of suite wiring:
 python3 scripts/evaluate_agent_gauntlet_suite.py --mode reference --repeats 1 --json
-# Backend comparison (Qdrant vs QMD):
-# Local Qdrant engine mode (requires qdrant-client in a venv)
-.venv-bench/bin/python scripts/evaluate_qdrant_vs_qmd.py --qdrant-local
-# Dedicated service mode (Qdrant must run on :6333)
-python3 scripts/evaluate_qdrant_vs_qmd.py --qdrant-url http://127.0.0.1:6333
-# Dedicated service mode with ephemeral Docker startup:
-python3 scripts/evaluate_qdrant_vs_qmd.py --start-qdrant-docker
 # Real project corpus hybrid benchmark (dense+sparse+RRF+rerank):
 .venv-bench/bin/python scripts/evaluate_qdrant_hybrid_real.py --project total-recall --sample-size 20 --top-k 5
 # Include real-memory gauntlet replay (runs codex exec tracks; slower):
 TOTAL_RECALL_GAUNTLET_TIMEOUT=220 .venv-bench/bin/python scripts/evaluate_qdrant_hybrid_real.py --project total-recall --sample-size 8 --top-k 5 --run-gauntlet-replay
-# Faster iteration mode with bounded qmd timeouts and compact warm memory cues:
-TOTAL_RECALL_GAUNTLET_TIMEOUT=220 .venv-bench/bin/python scripts/evaluate_qdrant_hybrid_real.py --project total-recall --sample-size 6 --top-k 5 --qmd-timeout 20 --qmd-search-timeout 8 --gauntlet-memory-k 2 --gauntlet-token-budget 420 --run-gauntlet-replay
+# Faster iteration mode with bounded baseline timeouts and compact warm memory cues:
+TOTAL_RECALL_GAUNTLET_TIMEOUT=220 .venv-bench/bin/python scripts/evaluate_qdrant_hybrid_real.py --project total-recall --sample-size 6 --top-k 5 --gauntlet-memory-k 2 --gauntlet-token-budget 420 --run-gauntlet-replay
 # Stability check across multiple gauntlet runs (median/faster-rate in JSON summary):
-TOTAL_RECALL_GAUNTLET_TIMEOUT=220 .venv-bench/bin/python scripts/evaluate_qdrant_hybrid_real.py --project total-recall --sample-size 2 --top-k 5 --qmd-timeout 20 --qmd-search-timeout 8 --gauntlet-memory-k 2 --gauntlet-token-budget 420 --gauntlet-repeats 2 --run-gauntlet-replay --json
+TOTAL_RECALL_GAUNTLET_TIMEOUT=220 .venv-bench/bin/python scripts/evaluate_qdrant_hybrid_real.py --project total-recall --sample-size 2 --top-k 5 --gauntlet-memory-k 2 --gauntlet-token-budget 420 --gauntlet-repeats 2 --run-gauntlet-replay --json
 ```
 
 Gauntlet trust methodology:
@@ -231,25 +248,24 @@ Research-to-implementation notes:
 | `TOTAL_RECALL_API_KEY` | — | Override client API key |
 | `TOTAL_RECALL_SYNC_INTERVAL_MINUTES` | `15` | Background sync interval |
 | `TOTAL_RECALL_QUERY_TOKEN_BUDGET` | `900` | Token budget used for query result shortlisting |
-| `TOTAL_RECALL_QUERY_RAW` | `0` | Set to `1` to disable shortlist optimization and return raw qmd output |
+| `TOTAL_RECALL_QUERY_RAW` | `0` | Set to `1` to disable shortlist optimization and return raw memory blocks |
 | `TOTAL_RECALL_PROCEDURAL_MIN_CONFIDENCE` | `0.58` | Minimum confidence to emit procedural recipe mode; lower confidence falls back to shortlist mode |
-| `TOTAL_RECALL_QUERY_MIN_RESULTS` | `4` | Minimum initial query hits before expanding retrieval with search/vsearch |
-| `TOTAL_RECALL_QMD_INDEX_PREFIX` | `total-recall` | Prefix used for per-project qmd index files (`<prefix>-<project>`) |
+| `TOTAL_RECALL_QDRANT_URL` | (empty) | Optional Qdrant service URL; if unset, uses local in-process Qdrant engine |
+| `TOTAL_RECALL_QDRANT_PYTHON` | auto-detect | Python executable that has `qdrant-client` and `fastembed` installed |
 
 ## Requirements
 
 **Standalone / Server:**
 - macOS (iCloud + launchd features are macOS-only; core memory works anywhere)
-- [bun](https://bun.sh) (for installing qmd)
-- [qmd](https://github.com/tobi/qmd) (installed automatically)
 - Python 3.8+ (for server and session ingestion)
+- `qdrant-client` + `fastembed` are auto-installed into `~/.ai-memory/.venv-qdrant` during `total-recall install`
 
 **Client only:**
 - Python 3.8+ (for CLI)
-- No bun or qmd needed — everything routes to the server
+- No local vector runtime needed — everything routes to the server
 
 **Optional (Qdrant benchmark tooling):**
-- `qdrant-client` in a virtualenv (for `scripts/evaluate_qdrant_vs_qmd.py --qdrant-local`)
+- `qdrant-client` in a virtualenv
 - `fastembed` in the same virtualenv (for `scripts/evaluate_qdrant_hybrid_real.py`)
 
 ## License
