@@ -191,7 +191,11 @@ fi
 
 if ! is_tty; then
   echo "No interactive terminal detected; running default install."
-  "$CLI" install "${passthrough_args[@]}"
+  if (( ${#passthrough_args[@]} > 0 )); then
+    "$CLI" install "${passthrough_args[@]}"
+  else
+    "$CLI" install
+  fi
   echo "Done."
   exit 0
 fi
