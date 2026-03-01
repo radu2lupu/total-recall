@@ -40,11 +40,11 @@ Once installed, memory is fully automatic:
 - **Session end**: Claude/Codex write a summary of what was done, decisions made, and lessons learned
 - **Mid-session**: Claude/Codex query memory when encountering problems where prior context could help
 
-No manual commands needed. Three enforcement layers make this reliable:
+No manual commands needed. Enforcement layers:
 
-1. **SessionStart hook** — fires before Claude sees the user's message, forcing a memory query as the first action
-2. **CLAUDE.md instructions** — detailed rules for when to query and when to write
-3. **Stop hook** — blocks session end until a memory summary is written
+1. **SessionStart hook (Claude plugin)** — fires before Claude sees the user's message, forcing a memory query as the first action
+2. **Stop hook (Claude plugin)** — blocks session end until a memory summary is written
+3. **Instruction blocks (`CLAUDE.md` + `AGENTS.md`)** — explicit rules for when to query and when to write (used by both Claude and Codex)
 
 ## Architecture
 
@@ -162,7 +162,7 @@ total-recall install --project my-project --client \
 
 Run a deterministic integration check to ensure Codex has:
 - Total Recall instructions in `~/.codex/AGENTS.md`
-- qmd MCP wiring in `~/.codex/config.toml`
+- qmd MCP wiring in `~/.codex/config.toml` (required for local standalone/server mode; optional in client-mode sandbox checks)
 - working `total-recall query` command path
 
 ```bash
